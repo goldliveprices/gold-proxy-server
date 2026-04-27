@@ -58,7 +58,7 @@ const HDR = (jwt) => ({
   'X-UserType':       'USER',
   'X-SourceID':       'WEB',
   'X-ClientLocalIP':  '127.0.0.1',
-  'X-ClientPublicIP': '74.220.52.100',
+  'X-ClientPublicIP': '35.160.120.126',
   'X-MACAddress':     'fe:80:00:00:00:00',
   'X-PrivateKey':     API_KEY,
   ...(jwt ? { 'Authorization': 'Bearer '+jwt } : {})
