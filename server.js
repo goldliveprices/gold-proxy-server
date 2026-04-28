@@ -139,14 +139,28 @@ async function getSpotRates() {
       const gold   = r.data.find(x => x.gold)?.gold;
       const silver = r.data.find(x => x.silver)?.silver;
       // Validate: Gold should be between 2000-5000 USD/oz
-      if (gold && silver && gold > 2000 && gold < 6000 && silver > 10 && silver < 100) {
+      if (gold && silver && gold > 3000 && gold < 8000 && silver > 20 && silver < 200) {
         console.log('[SPOT] metals.live OK: xau='+gold+' xag='+silver);
         return {xauUsd: gold, xagUsd: silver, src: 'metals.live'};
       }
     }
   } catch(e) { console.log('[SPOT] metals.live failed:', e.message.slice(0,50)); }
 
-  // Source 2: goldprice.org with mobile user agent
+  // Source 2: Coinbase (gives real XAU/XAG spot prices)
+  try {
+    const [r1,r2] = await Promise.all([
+      axios.get('https://api.coinbase.com/v2/exchange-rates?currency=XAU', {timeout:6000}),
+      axios.get('https://api.coinbase.com/v2/exchange-rates?currency=XAG', {timeout:6000})
+    ]);
+    const xauUsd = parseFloat(r1.data?.data?.rates?.USD) || 0;
+    const xagUsd = parseFloat(r2.data?.data?.rates?.USD) || 0;
+    if (!isNaN(xauUsd) && !isNaN(xagUsd) && xauUsd > 3000 && xauUsd < 8000 && xagUsd > 20 && xagUsd < 200) {
+      console.log('[SPOT] coinbase OK: xau='+xauUsd+' xag='+xagUsd);
+      return {xauUsd, xagUsd, src:'coinbase'};
+    }
+  } catch(e) { console.log('[SPOT] coinbase failed:', e.message.slice(0,50)); }
+
+  // Source 3: goldprice.org with mobile user agent
   try {
     const r = await axios.get('https://data-asg.goldprice.org/dbXRates/USD', {
       headers: {
@@ -159,7 +173,7 @@ async function getSpotRates() {
     if (r.data?.items?.[0]) {
       const gold   = r.data.items[0].xauPrice;
       const silver = r.data.items[0].xagPrice;
-      if (gold > 2000 && gold < 6000 && silver > 10 && silver < 100) {
+      if (gold > 3000 && gold < 8000 && silver > 20 && silver < 200) {
         console.log('[SPOT] goldprice.org OK: xau='+gold+' xag='+silver);
         return {xauUsd: gold, xagUsd: silver, src: 'goldprice.org'};
       }
@@ -184,7 +198,7 @@ async function getForex() {
     );
     const rate = r.data?.rates?.INR;
     // Validate: USD/INR should be between 70-100
-    if (rate && rate > 70 && rate < 100) {
+    if (rate && rate > 70 && rate < 110) {
       console.log('[FOREX] frankfurter OK: '+rate);
       return rate;
     }
@@ -197,7 +211,7 @@ async function getForex() {
       {timeout: 5000}
     );
     const rate = r.data?.rates?.INR;
-    if (rate && rate > 70 && rate < 100) {
+    if (rate && rate > 70 && rate < 110) {
       console.log('[FOREX] open.er-api OK: '+rate);
       return rate;
     }
@@ -205,7 +219,7 @@ async function getForex() {
 
   // Last known approximate
   console.log('[FOREX] All failed - using 84.5');
-  return 84.5;
+  return 94.5;
 }
 
 // ═══════════════════════════════════════
@@ -319,8 +333,8 @@ app.get('/rates', async (req,res) => {
     // MCX Correction factors (import duty 15% + GST 3% + premium)
     // Gold factor:   1.656 (verified against actual MCX)
     // Silver factor: 2.668 (verified against actual MCX)
-    const goldFactor   = 1.6751;
-    const silverFactor = 2.7662;
+    const goldFactor   = 1.0920;
+    const silverFactor = 1.0661;
 
     const g  = Math.round((spot.xauUsd/31.1035)*10*usdInr*goldFactor);
     const s  = Math.round((spot.xagUsd/31.1035)*1000*usdInr*silverFactor);
