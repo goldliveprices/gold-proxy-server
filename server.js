@@ -7,19 +7,11 @@ const app     = express();
 app.use(cors());
 app.use(express.json());
 
-// ═══════════════════════════════════
-// ANGEL ONE CREDENTIALS
-// ═══════════════════════════════════
 const CLIENT_ID   = 'AAAA238852';
 const API_KEY     = 'DPAHMIXr';
 const TOTP_SECRET = 'XXNWX47RXA5KYW3BB45D4CX474';
 const ANGEL_PIN   = '1857';
 
-// ═══════════════════════════════════
-// MCX CONTRACT CYCLES
-// Gold:   JUN AUG OCT DEC FEB APR
-// Silver: MAY JUL SEP DEC MAR
-// ═══════════════════════════════════
 const MONTHS   = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
 const GOLD_M   = [5,7,9,11,1,3];
 const SILVER_M = [4,6,8,11,2];
@@ -35,9 +27,6 @@ function getContracts(validM) {
   return out;
 }
 
-// ═══════════════════════════════════
-// TOTP - multi window for time drift
-// ═══════════════════════════════════
 function generateTOTP(secret, offset) {
   const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
   let bits = '';
@@ -60,10 +49,8 @@ function generateTOTP(secret, offset) {
   return code.toString().padStart(6,'0');
 }
 
-// ═══════════════════════════════════
-// HEADERS - USE REGISTERED IP
-// IP registered in Angel: 74.220.52.100
-// ═══════════════════════════════════
+let JWT=null, JWT_EXP=0;
+
 const HDR = (jwt) => ({
   'Content-Type':     'application/json',
   'Accept':           'application/json',
@@ -76,27 +63,23 @@ const HDR = (jwt) => ({
   ...(jwt ? {'Authorization':'Bearer '+jwt} : {})
 });
 
-let JWT=null, JWT_EXP=0;
-
 async function login() {
   if (JWT && Date.now() < JWT_EXP) return JWT;
   for (const w of [-4,-3,-2,-1,0,1,2,3,4]) {
     const pin = generateTOTP(TOTP_SECRET, w);
-    console.log(`[AUTH] window=${w} totp=${pin}`);
     try {
       const r = await axios.post(
         'https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword',
         {clientcode:CLIENT_ID, password:ANGEL_PIN, totp:pin},
         {headers:HDR(), timeout:10000}
       );
-      console.log('[AUTH]', JSON.stringify(r.data).slice(0,150));
       if (r.data.status && r.data.data?.jwtToken) {
         JWT=r.data.data.jwtToken;
         JWT_EXP=Date.now()+6*60*60*1000;
         console.log('[AUTH] SUCCESS window='+w);
         return JWT;
       }
-    } catch(e) { console.log('[AUTH] window='+w+' err='+e.message); }
+    } catch(e) {}
   }
   throw new Error('Angel login failed - IP not whitelisted yet');
 }
@@ -126,93 +109,120 @@ async function getQuote(jwt, token) {
   };
 }
 
-// ═══════════════════════════════════
-// FREE FOREX - no API key needed
-// ═══════════════════════════════════
-async function getForex() {
-  // Try multiple free forex sources
+// ── REAL SPOT RATES (multiple sources) ──
+async function getSpotRates() {
+  // Source 1: metals-api (free, no key needed for basic)
   try {
     const r = await axios.get(
-      'https://api.frankfurter.app/latest?from=USD&to=INR',
-      {timeout:5000}
+      'https://api.metals.live/v1/spot/gold,silver',
+      {timeout:6000}
     );
-    return r.data.rates.INR;
-  } catch(e) {
-    // Backup forex
-    try {
-      const r = await axios.get(
-        'https://open.er-api.com/v6/latest/USD',
-        {timeout:5000}
-      );
-      return r.data.rates.INR;
-    } catch(e2) {
-      return 94.25; // last known
+    if (r.data && r.data[0]) {
+      const gold = r.data.find(x => x.gold)?.gold;
+      const silver = r.data.find(x => x.silver)?.silver;
+      if (gold && silver) {
+        console.log('[SPOT] metals.live: gold='+gold+' silver='+silver);
+        return {xauUsd: gold, xagUsd: silver, src:'metals.live'};
+      }
     }
-  }
-}
+  } catch(e) { console.log('[SPOT] metals.live failed:', e.message); }
 
-// ═══════════════════════════════════
-// FREE SPOT GOLD/SILVER (no key)
-// ═══════════════════════════════════
-async function getSpotRates() {
+  // Source 2: commodities-api free tier
+  try {
+    const r = await axios.get(
+      'https://api.coinbase.com/v2/exchange-rates?currency=XAU',
+      {timeout:6000}
+    );
+    const usd = parseFloat(r.data?.data?.rates?.USD);
+    if (usd) {
+      const xauUsd = usd;
+      // Get silver separately
+      const r2 = await axios.get(
+        'https://api.coinbase.com/v2/exchange-rates?currency=XAG',
+        {timeout:6000}
+      );
+      const xagUsd = parseFloat(r2.data?.data?.rates?.USD);
+      if (xauUsd && xagUsd) {
+        console.log('[SPOT] coinbase: xau='+xauUsd+' xag='+xagUsd);
+        return {xauUsd, xagUsd, src:'coinbase'};
+      }
+    }
+  } catch(e) { console.log('[SPOT] coinbase failed:', e.message); }
+
+  // Source 3: goldprice.org with different approach
   try {
     const r = await axios.get('https://data-asg.goldprice.org/dbXRates/USD', {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer':    'https://www.goldprice.org/',
-        'Origin':     'https://www.goldprice.org'
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
+        'Referer':    'https://goldprice.org/',
+        'Origin':     'https://goldprice.org'
       },
       timeout: 8000
     });
-    return {
-      xauUsd: r.data.items[0].xauPrice,
-      xagUsd: r.data.items[0].xagPrice
-    };
+    if (r.data?.items?.[0]) {
+      const xauUsd = r.data.items[0].xauPrice;
+      const xagUsd = r.data.items[0].xagPrice;
+      console.log('[SPOT] goldprice.org: xau='+xauUsd+' xag='+xagUsd);
+      return {xauUsd, xagUsd, src:'goldprice.org'};
+    }
+  } catch(e) { console.log('[SPOT] goldprice.org failed:', e.message); }
+
+  // Last resort fixed
+  console.log('[SPOT] All failed - using fixed rates');
+  // Last resort - approximate current market rates (update if needed)
+  return {xauUsd: 3340, xagUsd: 33.0, src:'fixed'};
+}
+
+async function getForex() {
+  try {
+    const r = await axios.get('https://api.frankfurter.app/latest?from=USD&to=INR', {timeout:5000});
+    return r.data.rates.INR;
   } catch(e) {
-    return { xauUsd: 4720, xagUsd: 76.4 };
+    try {
+      const r = await axios.get('https://open.er-api.com/v6/latest/USD', {timeout:5000});
+      return r.data.rates.INR;
+    } catch(e2) { return 94.25; }
   }
 }
 
-// ═══════════════════════════════════
-// ROUTES
-// ═══════════════════════════════════
 app.get('/', (req,res) => res.json({
-  status: 'RR Jewellers Gold Server v6',
-  endpoints: ['/rates', '/login-test', '/debug']
+  status: 'RR Jewellers Gold Server - Multi Source',
+  endpoints: ['/rates', '/login-test', '/debug', '/spot-test']
 }));
+
+// Test spot rates
+app.get('/spot-test', async (req,res) => {
+  const spot = await getSpotRates();
+  const usdInr = await getForex();
+  res.json({spot, usdInr, calculated: {
+    gold10g: Math.round((spot.xauUsd/31.1035)*10*usdInr),
+    silverKg: Math.round((spot.xagUsd/31.1035)*1000*usdInr)
+  }});
+});
 
 app.get('/login-test', async (req,res) => {
   try {
     const jwt = await login();
     res.json({success:true, preview:jwt.slice(0,20)+'...'});
-  } catch(e) {
-    res.json({success:false, error:e.message});
-  }
+  } catch(e) { res.json({success:false, error:e.message}); }
 });
 
 app.get('/debug', async (req,res) => {
   try {
     const jwt = await login();
     const gC=getContracts(GOLD_M), sC=getContracts(SILVER_M);
-    const [gR,sR] = await Promise.all([
-      searchMCX(jwt,'GOLD'+gC[0]),
-      searchMCX(jwt,'SILVER'+sC[0])
-    ]);
+    const [gR,sR] = await Promise.all([searchMCX(jwt,'GOLD'+gC[0]), searchMCX(jwt,'SILVER'+sC[0])]);
     res.json({goldContracts:gC, silverContracts:sC, goldTop3:gR.slice(0,3), silverTop3:sR.slice(0,3)});
-  } catch(e) {
-    res.json({error:e.message});
-  }
+  } catch(e) { res.json({error:e.message}); }
 });
 
 app.get('/rates', async (req,res) => {
-  // Always get forex and spot (free, no limits)
-  const [usdInr, spot] = await Promise.all([getForex(), getSpotRates()]);
+  // Always fetch spot + forex (independent of Angel)
+  const [spot, usdInr] = await Promise.all([getSpotRates(), getForex()]);
 
   try {
-    // Try Angel MCX
     const jwt = await login();
     const gC=getContracts(GOLD_M), sC=getContracts(SILVER_M);
-    console.log('[RATES] Gold:',gC,'Silver:',sC);
 
     const [gCR,gNR,sCR,sNR] = await Promise.all([
       searchMCX(jwt,'GOLD'  +gC[0]), searchMCX(jwt,'GOLD'  +gC[1]),
@@ -240,20 +250,19 @@ app.get('/rates', async (req,res) => {
         goldNext:  {bid:Math.round(gNext.bid),ask:Math.round(gNext.ask),high:Math.round(gNext.high),low:Math.round(gNext.low)},
         silverNext:{bid:Math.round(sNext.bid),ask:Math.round(sNext.ask),high:Math.round(sNext.high),low:Math.round(sNext.low)}
       },
-      xauUsd: spot.xauUsd,
-      xagUsd: spot.xagUsd,
-      usdInr,
+      xauUsd:spot.xauUsd, xagUsd:spot.xagUsd, usdInr,
+      spotSource: spot.src,
       timestamp: new Date().toISOString()
     });
 
   } catch(angelErr) {
-    // Fallback - still return real spot + forex data
     console.log('[FALLBACK]', angelErr.message);
     const g  = Math.round((spot.xauUsd/31.1035)*10*usdInr);
     const s  = Math.round((spot.xagUsd/31.1035)*1000*usdInr);
     const gS = g*0.0009, sS=s*0.0012;
     res.json({
       success:true, source:'fallback_spot',
+      spotSource: spot.src,
       goldPer10g:g, silverPerKg:s,
       futures:{
         gold:      {bid:Math.round(g-180-gS),  ask:Math.round(g-180+gS),  high:Math.round(g*1.003),     low:Math.round(g*0.994)    },
@@ -261,10 +270,8 @@ app.get('/rates', async (req,res) => {
         goldNext:  {bid:Math.round(g+1320-gS), ask:Math.round(g+1320+gS), high:Math.round(g*1.005+1500),low:Math.round(g*0.996+1500)},
         silverNext:{bid:Math.round(s+1700-sS), ask:Math.round(s+1700+sS), high:Math.round(s*1.013+3500),low:Math.round(s*0.984+3500)}
       },
-      xauUsd: spot.xauUsd,
-      xagUsd: spot.xagUsd,
-      usdInr,
-      angelError: angelErr.message,
+      xauUsd:spot.xauUsd, xagUsd:spot.xagUsd, usdInr,
+      angelError:angelErr.message,
       timestamp: new Date().toISOString()
     });
   }
@@ -272,11 +279,11 @@ app.get('/rates', async (req,res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, ()=>{
-  console.log('RR Jewellers Server v6 port '+PORT);
+  console.log('RR Jewellers Gold Server running port '+PORT);
   // Self-ping every 4 minutes to prevent Render sleep
   setInterval(function(){
     require('https').get('https://gold-proxy-server.onrender.com/', function(r){
-      console.log('[PING] Self-ping OK - server awake');
+      console.log('[PING] Self-ping OK');
     }).on('error', function(){});
   }, 4 * 60 * 1000);
 });
