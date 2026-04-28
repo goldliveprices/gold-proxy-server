@@ -271,4 +271,12 @@ app.get('/rates', async (req,res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, ()=>console.log('RR Jewellers Server v6 port '+PORT));
+app.listen(PORT, ()=>{
+  console.log('RR Jewellers Server v6 port '+PORT);
+  // Self-ping every 4 minutes to prevent Render sleep
+  setInterval(function(){
+    require('https').get('https://gold-proxy-server.onrender.com/', function(r){
+      console.log('[PING] Self-ping OK - server awake');
+    }).on('error', function(){});
+  }, 4 * 60 * 1000);
+});
