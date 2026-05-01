@@ -1,12 +1,12 @@
 /**
- * RR Jewellers Gold Server v15  -  PRODUCTION LIVE BUILD
+ * RR Jewellers Gold Server v16  -  PRODUCTION LIVE BUILD
  * ═══════════════════════════════════════════════════════════════
  *
- * FIXES in v15 (Unbreakable Token Scanner):
- * 1. Fixed "Tokens Missing" / "null" error.
- * 2. Now parses the exact 'expiry' field from Angel One JSON 
- * instead of relying on strict regex symbol names.
- * 3. Extracts 'JUN26' directly from '05JUN2026' expiry string.
+ * FIXES in v16:
+ * 1. Restored the root ('/') route to fix "Cannot GET /" white screen.
+ * 2. Added detailed Error Catching for Angel Login to see exactly
+ * WHY Angel One is rejecting the connection.
+ * 3. Enhanced Token Filter to strictly avoid "GOLDTEN" or weird variants.
  *
  * ═══════════════════════════════════════════════════════════════
  */
@@ -56,7 +56,7 @@ function isMCXOpen() {
 }
 
 // ───────────────────────────────────────────────────────────────
-// NEW SMART TOKEN CACHE BUILDER (Fixes the null token issue)
+// SMART TOKEN CACHE BUILDER
 // ───────────────────────────────────────────────────────────────
 let tokenCache   = {};
 let cacheBuiltAt = 0;
@@ -80,15 +80,14 @@ async function buildScripCache() {
 
       const sym = (inst.symbol || '').toUpperCase().trim();
       const tok = inst.token;
-      const exp = (inst.expiry || '').toUpperCase().trim(); // Expected format: "05JUN2026"
+      const exp = (inst.expiry || '').toUpperCase().trim(); 
 
       if (!sym || !tok) continue;
 
-      // Smart Extraction: Extract "JUN26" from "05JUN2026"
       let label = null;
       const expMatch = exp.match(/([A-Z]{3})20(\d{2})/);
       if (expMatch) {
-        label = expMatch[1] + expMatch[2]; // Gives "JUN26"
+        label = expMatch[1] + expMatch[2]; 
       } else {
         const symMatch = sym.match(/([A-Z]{3})(\d{2})/);
         if (symMatch) label = symMatch[1] + symMatch[2];
@@ -96,13 +95,12 @@ async function buildScripCache() {
 
       if (!label || !MONTHS.includes(label.slice(0,3))) continue;
 
-      // Save Gold Tokens
-      if (sym.startsWith('GOLD') && !sym.startsWith('GOLDM') && !sym.startsWith('GOLDPETAL') && !sym.startsWith('GOLDGUINEA')) {
+      // Filter out GOLDTEN, GOLDM, etc. Only get pure 1KG GOLD
+      if (sym.startsWith('GOLD') && !sym.includes('GOLDM') && !sym.includes('GOLDPETAL') && !sym.includes('GOLDGUINEA') && !sym.includes('TEN')) {
         newCache['GOLD'][label] = { symboltoken: tok, tradingsymbol: sym };
       }
 
-      // Save Silver Tokens (Prefer 30kg variants if available)
-      if (sym.startsWith('SILVER') && !sym.startsWith('SILVERM') && !sym.startsWith('SILVERMIC')) {
+      if (sym.startsWith('SILVER') && !sym.includes('SILVERM') && !sym.includes('SILVERMIC')) {
         const existing = newCache['SILVER'][label];
         if (!existing || sym.startsWith('SILVER30')) {
           newCache['SILVER'][label] = { symboltoken: tok, tradingsymbol: sym };
@@ -112,10 +110,8 @@ async function buildScripCache() {
 
     tokenCache = newCache;
     cacheBuiltAt = Date.now();
-    console.log('[CACHE] Built Successfully. Gold:', Object.keys(tokenCache.GOLD).length, 'Silver:', Object.keys(tokenCache.SILVER).length);
     return true;
   } catch (e) {
-    console.log('[CACHE] Build failed:', e.message);
     return false;
   }
 }
@@ -194,7 +190,7 @@ const HDR = (jwt) => ({
   'X-UserType':       'USER',
   'X-SourceID':       'WEB',
   'X-ClientLocalIP':  '127.0.0.1',
-  'X-ClientPublicIP': '74.220.52.100',
+  'X-ClientPublicIP': '127.0.0.1', 
   'X-MACAddress':     'fe:80:00:00:00:00',
   'X-PrivateKey':     API_KEY,
   ...(jwt ? { 'Authorization': 'Bearer ' + jwt } : {}),
@@ -203,6 +199,8 @@ const HDR = (jwt) => ({
 async function login() {
   if (JWT && Date.now() < JWT_EXP) return JWT;
   JWT = null; JWT_EXP = 0;
+  
+  let lastError = "Unknown Login Error";
 
   for (const w of [-4, -3, -2, -1, 0, 1, 2, 3, 4]) {
     const pin = generateTOTP(TOTP_SECRET, w);
@@ -216,14 +214,19 @@ async function login() {
         JWT = r.data.data.jwtToken;
         JWT_EXP = Date.now() + 6 * 60 * 60 * 1000;
         return JWT;
+      } else {
+        lastError = r.data.message || "Invalid status from Angel One";
       }
-    } catch (e) {}
+    } catch (e) {
+        lastError = e.response?.data?.message || e.message;
+    }
   }
-  throw new Error('Angel login failed');
+  
+  throw new Error(`Angel login failed: ${lastError}. Check your TOTP Secret or SmartAPI Dashboard.`);
 }
 
 // ───────────────────────────────────────────────────────────────
-// LIVE QUOTES AND SPOT FETCHERS
+// DATA FETCHERS
 // ───────────────────────────────────────────────────────────────
 async function getBulkQuotes(jwt, tokens) {
   const validTokens = tokens.filter(t => t);
@@ -266,6 +269,16 @@ async function getForex() {
 // ───────────────────────────────────────────────────────────────
 // API ROUTES
 // ───────────────────────────────────────────────────────────────
+
+// FIX: Added the Home Route back!
+app.get('/', (req, res) => {
+    res.json({
+        status: "Server is Running smoothly!",
+        endpoints: ["/rates", "/debug", "/updates"],
+        mcxMarketOpen: isMCXOpen()
+    });
+});
+
 app.get('/rates', async (req, res) => {
   const marketOpen = isMCXOpen();
   let liveErr = null;
@@ -277,9 +290,7 @@ app.get('/rates', async (req, res) => {
     const gC = getDynamicContracts('GOLD');
     const sC = getDynamicContracts('SILVER');
 
-    if (!gC.length || !sC.length) {
-      throw new Error('No active contracts found. Cache might be empty.');
-    }
+    if (!gC.length || !sC.length) throw new Error('No active contracts found. Cache might be empty.');
 
     const [gCurTok, gNxtTok, sCurTok, sNxtTok] = await Promise.all([
       findToken(jwt, 'GOLD', gC[0]),
@@ -288,9 +299,7 @@ app.get('/rates', async (req, res) => {
       sC[1] ? findToken(jwt, 'SILVER', sC[1]) : Promise.resolve(null),
     ]);
 
-    if (!gCurTok || !sCurTok) {
-      throw new Error(`Tokens missing for GOLD ${gC[0]} or SILVER ${sC[0]}`);
-    }
+    if (!gCurTok || !sCurTok) throw new Error(`Tokens missing for GOLD ${gC[0]} or SILVER ${sC[0]}`);
 
     const tokensToFetch = [gCurTok.symboltoken, sCurTok.symboltoken];
     if (gNxtTok) tokensToFetch.push(gNxtTok.symboltoken);
@@ -302,9 +311,7 @@ app.get('/rates', async (req, res) => {
       getForex()
     ]);
 
-    if (quotesRes.status === 'rejected' || !quotesRes.value) {
-      throw new Error('Quote network error from Angel API');
-    }
+    if (quotesRes.status === 'rejected' || !quotesRes.value) throw new Error('Quote network error from Angel API');
 
     const quotes = quotesRes.value;
     const spotData = spotRes.status === 'fulfilled' ? spotRes.value : { xauUsd: 0, xagUsd: 0, src: 'error' };
@@ -315,9 +322,7 @@ app.get('/rates', async (req, res) => {
     const gNextRaw = gNxtTok ? quotes[gNxtTok.symboltoken] : null;
     const sNextRaw = sNxtTok ? quotes[sNxtTok.symboltoken] : null;
 
-    if (gCurr.ltp === 0 || sCurr.ltp === 0) {
-      throw new Error('Market returned 0 LTP - likely closed');
-    }
+    if (gCurr.ltp === 0 || sCurr.ltp === 0) throw new Error('Market returned 0 LTP - likely closed');
 
     const gNext = gNextRaw?.ltp > 0 ? gNextRaw : gCurr;
     const sNext = sNextRaw?.ltp > 0 ? sNextRaw : sCurr;
@@ -395,7 +400,7 @@ app.get('/updates', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log('═══════════════════════════════════════════');
-  console.log(' RR Jewellers Server v15 - Unbreakable Fix ');
+  console.log(' RR Jewellers Server v16 - Authentication Fix');
   console.log('═══════════════════════════════════════════');
   await buildScripCache();
   setInterval(async () => { await buildScripCache(); }, 12 * 60 * 60 * 1000);
