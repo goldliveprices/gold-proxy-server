@@ -416,6 +416,7 @@ app.get('/ping', (req, res) => res.json({ ok: true }));
 
 // MAIN RATES ENDPOINT — MCX LIVE ONLY, NO MOCK LTP
 app.get('/rates', async (req, res) => {
+  try {
   // 1) Always fetch international spot + forex (24x7)
   const spotRes = await getSpotRates();
   const usdInr  = (spotRes.usdInr && spotRes.usdInr > 70) ? spotRes.usdInr : await getForex();
@@ -494,11 +495,22 @@ app.get('/rates', async (req, res) => {
       gold:   { current: gC[0], next: gC[1] || null, symbol: gCurTok?.tradingsymbol || 'GOLD_FUT' },
       silver: { current: sC[0], next: sC[1] || null, symbol: sCurTok?.tradingsymbol || 'SILVER_FUT' },
     },
+    // Top-level for index.html direct access
+    xauUsd: parseFloat(spotRes.xauUsd.toFixed(2)),
+    xagUsd: parseFloat(spotRes.xagUsd.toFixed(4)),
+    // usdInr already at top level below
     spot: {
       xauUsd:      parseFloat(spotRes.xauUsd.toFixed(2)),
       xagUsd:      parseFloat(spotRes.xagUsd.toFixed(4)),
       xauInrPerOz: Math.round(spotRes.xauInrPerOz),
       xagInrPerOz: Math.round(spotRes.xagInrPerOz),
+      // Day High/Low — passed through from gold-api if available
+      xauUsdHigh:  spotRes.xauUsdHigh ? parseFloat(spotRes.xauUsdHigh.toFixed(2)) : null,
+      xauUsdLow:   spotRes.xauUsdLow  ? parseFloat(spotRes.xauUsdLow.toFixed(2))  : null,
+      xagUsdHigh:  spotRes.xagUsdHigh ? parseFloat(spotRes.xagUsdHigh.toFixed(4)) : null,
+      xagUsdLow:   spotRes.xagUsdLow  ? parseFloat(spotRes.xagUsdLow.toFixed(4))  : null,
+      usdInrHigh:  spotRes.usdInrHigh ? parseFloat(spotRes.usdInrHigh.toFixed(4)) : null,
+      usdInrLow:   spotRes.usdInrLow  ? parseFloat(spotRes.usdInrLow.toFixed(4))  : null,
     },
     derivedFromSpot: {
       goldPer10g:  derived.goldPer10g,
@@ -515,6 +527,11 @@ app.get('/rates', async (req, res) => {
     },
     timestamp: new Date().toISOString(),
   });
+
+  } catch (e) {
+    console.error('❌ /rates fatal:', e.message);
+    return res.status(500).json({ success: false, source: 'error', error: e.message });
+  }
 });
 
 // Debug + updates endpoints kept same as before
