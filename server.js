@@ -1,718 +1,711 @@
-'use strict';
-
 /**
- * R.R Jewellers — Gold & Silver Rates Server v24
- * 
- * ARCHITECTURE:
- * - Angel One SmartAPI WebSocket → per-second MCX ticks (SNAP_QUOTE mode)
- * - In-memory tick cache → /rates returns instantly (no wait)
- * - SSE /stream endpoint → index.html gets pushed on every tick
- * - Spot rates polled every 30s from gold-api / goldprice.org
+ * RR Jewellers Gold Server v14 - FULLY DEBUGGED
+ * ═══════════════════════════════════════════════════════════════
+ * BUGS FIXED vs v13:
+ * 1.  getIST()           — missing closing `}`
+ * 2.  getExpiryDate()    — missing closing `}`
+ * 3.  getContracts()     — broken if/else brace structure → wrong contract
+ * 4.  isMCXOpen()        — missing closing `}` + Saturday hours added
+ * 5.  buildScripCache()  — GOLD/SILVER if-blocks missing closing `}`
+ * 6.  ensureCache()      — missing closing `}` for if + function
+ * 7.  findToken()        — SILVER array missing `]` (SyntaxError)
+ * 8.  findToken()        — .filter() callback missing closing `)`
+ * 9.  generateTOTP()     — for-loop + function missing closing `}`
+ * 10. login()            — if/for/function all missing closing `}`
+ * 11. searchScrip()      — try/catch missing closing `}`
+ * 12. getQuote()         — try/catch missing closing `}`
+ * 13. getSpotRates()     — 3 try/catch blocks missing closing `}`
+ * 14. getForex()         — try/catch blocks missing closing `}`
+ * 15. getSpotDerivedRates() — try/catch missing closing `}`
+ * 16. /login-test route  — catch block missing closing `}`
+ * 17. /rates             — LTP=0 if-block missing closing `}`
+ * 18. frankfurter.app    — replaced (ECB has no INR). Now uses gold-api.com
+ * 19. Self-ping          — switched to axios (proper HTTPS + error handling)
+ * 20. Saturday hours     — MCX Commodity trades Sat 9AM-2PM IST (now enabled)
+ * ═══════════════════════════════════════════════════════════════
  */
 
-const express  = require('express');
-const cors     = require('cors');
-const axios    = require('axios');
-const crypto   = require('crypto');
-const https    = require('https');
-const WebSocket = require('ws');
-const app      = express();
+'use strict';
+
+const express = require('express');
+const cors    = require('cors');
+const axios   = require('axios');
+const crypto  = require('crypto');
+const app     = express();
 
 app.use(cors());
 app.use(express.json());
 
-// ═══════════════════════════════════════
-// CONFIG
-// ═══════════════════════════════════════
-const CLIENT_ID      = process.env.CLIENT_ID      || 'AAAA238852';
-const API_KEY        = process.env.API_KEY;
-const TOTP_SECRET    = process.env.TOTP_SECRET    || 'XXNWX47RXA5KYW3BB45D4CX474';
-const ANGEL_PIN      = process.env.ANGEL_PIN      || '1857';
-const SHEET_ID       = process.env.SHEET_ID       || '';
-const SELF_URL       = process.env.SELF_URL       || 'https://gold-proxy-server.onrender.com/ping';
-const PROXY_URL      = process.env.QUOTAGUARDSTATIC_URL || null;
-const PREMIUM_FACTOR = parseFloat(process.env.PREMIUM_FACTOR || '1.103');
-const PORT           = process.env.PORT || 3000;
+// ───────────────────────────────────────────────────────────────
+// CONFIG & CREDENTIALS
+// ───────────────────────────────────────────────────────────────
+const CLIENT_ID   = process.env.CLIENT_ID   || 'AAAA238852';
+const API_KEY     = process.env.API_KEY     || 'DPAHMIXr';
+const TOTP_SECRET = process.env.TOTP_SECRET || 'XXNWX47RXA5KYW3BB45D4CX474';
+const ANGEL_PIN   = process.env.ANGEL_PIN   || '1857';
+const SHEET_ID    = process.env.SHEET_ID    || '';
+const SELF_URL    = process.env.SELF_URL    || 'https://gold-proxy-server.onrender.com';
 
-const MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+// ───────────────────────────────────────────────────────────────
+// MCX CONTRACT MONTHS (0-indexed JS months)
+// GOLD  : FEB=1, APR=3, JUN=5, AUG=7, OCT=9, DEC=11
+// SILVER: MAR=2, MAY=4, JUL=6, SEP=8, DEC=11
+// ───────────────────────────────────────────────────────────────
+const MONTHS   = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+const GOLD_M   = [1, 3, 5, 7, 9, 11];
+const SILVER_M = [2, 4, 6, 8, 11];
 
-// ═══════════════════════════════════════
-// IN-MEMORY TICK STORE
-// ═══════════════════════════════════════
-let tickStore = {};        // { [symbolToken]: { ltp, bid, ask, high, low, open, close, ts } }
-let spotStore = {          // latest spot rates
-  xauUsd: 0, xagUsd: 0, usdInr: 0,
-  xauInrPerOz: 0, xagInrPerOz: 0,
-  xauUsdHigh: null, xauUsdLow: null,
-  xagUsdHigh: null, xagUsdLow: null,
-  usdInrHigh: null, usdInrLow: null,
-  src: 'init', ts: 0
-};
-let tokenMap = {};          // { [symbolToken]: 'GOLD_CUR' | 'GOLD_NXT' | 'SILVER_CUR' | 'SILVER_NXT' }
-let activeTokens = [];      // current MCX tokens to subscribe
-let wsConn = null;          // active WebSocket connection
-let feedToken = null;       // Angel feed token from login
-let JWT = null, JWT_EXP = 0;
-let wsReconnectTimer = null;
-let wsConnected = false;
-let lastWsTick = 0;
-
-// SSE clients
-let sseClients = new Set();
-
-// ═══════════════════════════════════════
-// PROXY
-// ═══════════════════════════════════════
-function makeAxios(useProxy = false) {
-  if (useProxy && PROXY_URL) {
-    try {
-      const u = new URL(PROXY_URL);
-      return axios.create({
-        proxy: { protocol: u.protocol.replace(':', ''), host: u.hostname,
-          port: parseInt(u.port) || 9293,
-          auth: u.username ? { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password) } : undefined }
-      });
-    } catch (e) {}
-  }
-  return axios;
-}
-
-// ═══════════════════════════════════════
-// IST HELPERS
-// ═══════════════════════════════════════
+// ───────────────────────────────────────────────────────────────
+// FIX #1 + #2 + #3 + #4: All helper functions properly closed
+// ───────────────────────────────────────────────────────────────
 function getIST() {
-  const ist = new Date(Date.now() + (5 * 60 + 30) * 60 * 1000);
-  return { year: ist.getUTCFullYear(), month: ist.getUTCMonth(), day: ist.getUTCDate(),
-           hour: ist.getUTCHours(), min: ist.getUTCMinutes(), dow: ist.getUTCDay() };
-}
-function isWeekday() { return getIST().dow !== 0; }
-const MCX_HOLIDAYS = new Set(['2026-01-26','2026-03-25','2026-04-02','2026-04-14',
-  '2026-04-30','2026-05-01','2026-08-15','2026-10-02','2026-10-20','2026-11-04','2026-12-25']);
-function isMCXHoliday() {
-  const { year, month, day } = getIST();
-  return MCX_HOLIDAYS.has(`${year}-${String(month+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`);
-}
-
-// ═══════════════════════════════════════
-// SCRIP MASTER CACHE
-// ═══════════════════════════════════════
-let tokenCache = { GOLD: {}, SILVER: {} };
-let cacheBuiltAt = 0;
-const CACHE_TTL = 22 * 60 * 60 * 1000;
+  const now = new Date();
+  const ist = new Date(now.getTime() + (5 * 60 + 30) * 60 * 1000);
+  return {
+    year:  ist.getUTCFullYear(),
+    month: ist.getUTCMonth(),   // 0-indexed
+    day:   ist.getUTCDate(),
+    hour:  ist.getUTCHours(),
+    min:   ist.getUTCMinutes(),
+    dow:   ist.getUTCDay(),     // 0=Sun
+  };
+} // FIX #1: closing brace added
 
 function getExpiryDate(year, month) {
   const fifth = new Date(Date.UTC(year, month, 5));
-  const dow = fifth.getUTCDay();
-  if (dow === 0) return new Date(Date.UTC(year, month, 3));
-  if (dow === 6) return new Date(Date.UTC(year, month, 4));
+  const dow   = fifth.getUTCDay();
+  if (dow === 0) return new Date(Date.UTC(year, month, 3)); // Sun → Fri
+  if (dow === 6) return new Date(Date.UTC(year, month, 4)); // Sat → Fri
   return fifth;
-}
+} // FIX #2: closing brace added
+
+function getContracts(validM) {
+  const ist = getIST();
+  let m = ist.month;
+  let y = ist.year;
+
+  if (validM.includes(m)) {
+    const expiry    = getExpiryDate(y, m);
+    const todayIST  = new Date(Date.UTC(y, m, ist.day));
+    if (todayIST > expiry) {
+      m++; if (m > 11) { m = 0; y++; }
+    }
+    // else: current month contract still active — keep m as is
+  } else {
+    // FIX #3: this else was missing — without it both branches advanced m
+    m++; if (m > 11) { m = 0; y++; }
+  }
+
+  const out = [];
+  for (let i = 0; i < 24 && out.length < 2; i++) {
+    if (validM.includes(m)) out.push(MONTHS[m] + y.toString().slice(-2));
+    m++; if (m > 11) { m = 0; y++; }
+  }
+  return out;
+} // FIX #3: proper brace structure
+
+// FIX #4 + #20: isMCXOpen now supports Saturday 9AM-2PM
+function isMCXOpen() {
+  const { dow, hour, min } = getIST();
+  if (dow === 0) return false; // Sunday always closed
+  const timeM = hour * 60 + min;
+  if (dow === 6) return timeM >= 9 * 60 && timeM < 14 * 60; // Sat 9AM-2PM
+  return timeM >= 9 * 60 && timeM < 23 * 60 + 55;           // Mon-Fri 9AM-11:55PM
+} // FIX #4: closing brace added
+
+// ───────────────────────────────────────────────────────────────
+// LAST-KNOWN RATES CACHE
+// ───────────────────────────────────────────────────────────────
+let lastKnownRates = null;
+
+// ───────────────────────────────────────────────────────────────
+// SCRIP MASTER CACHE
+// ───────────────────────────────────────────────────────────────
+let tokenCache   = {};
+let cacheBuiltAt = 0;
+const CACHE_TTL  = 22 * 60 * 60 * 1000;
 
 async function buildScripCache() {
   try {
-    console.log('📋 Fetching ScripMaster...');
+    console.log('[CACHE] Downloading Angel scrip master...');
     const r = await axios.get(
       'https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json',
       { timeout: 30000 }
     );
-    if (!Array.isArray(r.data) || r.data.length === 0) return false;
-    const nc = { GOLD: {}, SILVER: {} };
-    for (const inst of r.data) {
-      if (inst.exch_seg !== 'MCX' || inst.instrumenttype !== 'FUTCOM') continue;
+    const instruments = r.data;
+    if (!Array.isArray(instruments) || instruments.length === 0)
+      throw new Error('Empty scrip master response');
+
+    const mcx      = instruments.filter(i => i.exch_seg === 'MCX' && i.instrumenttype === 'FUTCOM');
+    const newCache = {};
+
+    for (const inst of mcx) {
       const sym = (inst.symbol || '').toUpperCase().trim();
       const tok = inst.token;
-      const exp = (inst.expiry || '').toUpperCase().trim();
       if (!sym || !tok) continue;
-      let label = null;
-      const em = exp.match(/([A-Z]{3})20(\d{2})/);
-      if (em) label = em[1] + em[2];
-      else { const sm = sym.match(/([A-Z]{3})(\d{2})/); if (sm) label = sm[1] + sm[2]; }
-      if (!label || !MONTHS.includes(label.slice(0,3))) continue;
-      if (sym.startsWith('GOLD') && !sym.includes('GOLDM') && !sym.includes('GOLDPETAL') && !sym.includes('GOLDGUINEA') && !sym.includes('TEN'))
-        nc.GOLD[label] = { symboltoken: String(tok), tradingsymbol: sym };
-      if (sym.startsWith('SILVER') && !sym.includes('SILVERM') && !sym.includes('SILVERMIC')) {
-        const ex = nc.SILVER[label];
-        if (!ex || sym.startsWith('SILVER30')) nc.SILVER[label] = { symboltoken: String(tok), tradingsymbol: sym };
-      }
+
+      // ── GOLD (1 kg main contract)
+      if (sym.startsWith('GOLD') && !sym.startsWith('GOLDM') &&
+          !sym.startsWith('GOLDPETAL') && !sym.startsWith('GOLDGUINEA')) {
+        const mm = sym.match(/^GOLD(\d{2})([A-Z]{3})FUT$|^GOLD([A-Z]{3})(\d{2})FUT$/);
+        if (!mm) continue;
+        let mon, yr2;
+        if (mm[1] && mm[2]) { yr2 = mm[1]; mon = mm[2]; }
+        else                 { mon = mm[3]; yr2 = mm[4]; }
+        if (!MONTHS.includes(mon)) continue;
+        const label = mon + yr2;
+        if (!newCache['GOLD']) newCache['GOLD'] = {};
+        if (!newCache['GOLD'][label])
+          newCache['GOLD'][label] = { symboltoken: tok, tradingsymbol: sym };
+        continue;
+      } // FIX #5: GOLD if-block properly closed
+
+      // ── SILVER (30 kg main contract)
+      if (sym.startsWith('SILVER') && !sym.startsWith('SILVERM') &&
+          !sym.startsWith('SILVERMIC')) {
+        const mm = sym.match(
+          /^SILVER30([A-Z]{3})(\d{2})FUT$|^SILVER(\d{2})([A-Z]{3})FUT$|^SILVER([A-Z]{3})(\d{2})FUT$/
+        );
+        if (!mm) continue;
+        let mon, yr2;
+        if (mm[1] && mm[2])      { mon = mm[1]; yr2 = mm[2]; }
+        else if (mm[3] && mm[4]) { yr2 = mm[3]; mon = mm[4]; }
+        else                     { mon = mm[5]; yr2 = mm[6]; }
+        if (!MONTHS.includes(mon)) continue;
+        const label    = mon + yr2;
+        if (!newCache['SILVER']) newCache['SILVER'] = {};
+        const existing = newCache['SILVER'][label];
+        if (!existing || sym.startsWith('SILVER30'))
+          newCache['SILVER'][label] = { symboltoken: tok, tradingsymbol: sym };
+      } // FIX #5: SILVER if-block properly closed
     }
-    tokenCache = nc; cacheBuiltAt = Date.now();
-    console.log(`✅ Cache GOLD:${Object.keys(nc.GOLD).length} SILVER:${Object.keys(nc.SILVER).length}`);
+
+    tokenCache   = newCache;
+    cacheBuiltAt = Date.now();
+    const gCount = Object.keys(newCache['GOLD']   || {}).length;
+    const sCount = Object.keys(newCache['SILVER'] || {}).length;
+    console.log('[CACHE] Built OK - GOLD:' + gCount + ' SILVER:' + sCount);
     return true;
-  } catch (e) { console.error('❌ buildScripCache:', e.message); return false; }
-}
+  } catch (e) {
+    console.log('[CACHE] Build failed:', e.message);
+    return false;
+  }
+} // FIX #5: function properly closed
 
 async function ensureCache() {
-  if (!cacheBuiltAt || Date.now() - cacheBuiltAt > CACHE_TTL) await buildScripCache();
-}
+  if (cacheBuiltAt === 0 || Date.now() - cacheBuiltAt > CACHE_TTL) {
+    await buildScripCache();
+  } // FIX #6: if-block closed
+} // FIX #6: function closed
 
-function getDynamicContracts(base) {
-  const cache = tokenCache[base] || {};
-  const now = getIST();
-  const curYr2 = parseInt(now.year.toString().slice(-2));
-  const valid = Object.keys(cache).filter(k => {
-    const mon = MONTHS.indexOf(k.slice(0,3)), yr2 = parseInt(k.slice(3,5));
-    if (yr2 < curYr2) return false;
-    if (yr2 === curYr2 && mon < now.month) return false;
-    if (yr2 === curYr2 && mon === now.month) {
-      const exp = getExpiryDate(now.year, mon);
-      if (new Date(Date.UTC(now.year, mon, now.day)) > exp) return false;
+async function findToken(jwt, base, contractLabel) {
+  await ensureCache();
+  const cached = tokenCache[base]?.[contractLabel];
+  if (cached) {
+    console.log('[TOKEN] cache hit: ' + base + contractLabel + ' -> ' + cached.tradingsymbol);
+    return cached;
+  }
+
+  console.log('[TOKEN] cache miss: ' + base + contractLabel + ' - trying searchScrip...');
+  const mon = contractLabel.slice(0, 3);
+  const yr2 = contractLabel.slice(3, 5);
+
+  // FIX #7: SILVER array was missing closing `]`
+  const queries = base === 'SILVER'
+    ? [
+        'SILVER30' + mon + yr2 + 'FUT',
+        'SILVER'   + yr2 + mon + 'FUT',
+        'SILVER'   + mon + yr2 + 'FUT',
+        'SILVER'   + mon + yr2,
+      ]
+    : [
+        base + yr2 + mon + 'FUT',
+        base + mon + yr2 + 'FUT',
+        base + mon + yr2,
+      ];
+
+  for (const q of queries) {
+    const results = await searchScrip(jwt, q);
+    if (results.length > 0) {
+      const hit = results[0];
+      console.log('[TOKEN] searchScrip hit: "' + q + '" -> ' + hit.tradingsymbol);
+      return { symboltoken: hit.symboltoken, tradingsymbol: hit.tradingsymbol };
     }
-    return true;
-  });
-  valid.sort((a,b) => {
-    const ya=parseInt(a.slice(3,5)),ma=MONTHS.indexOf(a.slice(0,3));
-    const yb=parseInt(b.slice(3,5)),mb=MONTHS.indexOf(b.slice(0,3));
-    return ya!==yb ? ya-yb : ma-mb;
-  });
-  return valid.slice(0,2);
-}
+  }
 
-// ═══════════════════════════════════════
-// TOTP + AUTH
-// ═══════════════════════════════════════
-function generateTOTP(secret, offset = 0) {
+  const broad  = await searchScrip(jwt, base);
+  const needle = (mon + yr2).toUpperCase();
+  // FIX #8: .filter() callback properly closed with `)`
+  const match  = broad
+    .filter(r =>
+      (r.tradingsymbol || '').toUpperCase().includes(needle) ||
+      (r.name         || '').toUpperCase().includes(needle)
+    )
+    .sort((a, b) => {
+      const aIs30 = (a.tradingsymbol || '').startsWith('SILVER30');
+      const bIs30 = (b.tradingsymbol || '').startsWith('SILVER30');
+      return (bIs30 ? 1 : 0) - (aIs30 ? 1 : 0);
+    })[0];
+
+  if (match) {
+    console.log('[TOKEN] broad match: ' + base + contractLabel + ' -> ' + match.tradingsymbol);
+    return { symboltoken: match.symboltoken, tradingsymbol: match.tradingsymbol };
+  }
+
+  console.log('[TOKEN] FAILED - no token for ' + base + contractLabel);
+  return null;
+} // FIX #8
+
+// ───────────────────────────────────────────────────────────────
+// TOTP GENERATOR — FIX #9: properly closed
+// ───────────────────────────────────────────────────────────────
+function generateTOTP(secret, offset) {
   const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
   let bits = '';
-  for (const c of secret.toUpperCase()) { const v = alpha.indexOf(c); if (v >= 0) bits += v.toString(2).padStart(5,'0'); }
+  for (const c of secret.toUpperCase()) {
+    const v = alpha.indexOf(c);
+    if (v >= 0) bits += v.toString(2).padStart(5, '0');
+  } // FIX #9: for-loop closed
   const bytes = [];
-  for (let i = 0; i+8 <= bits.length; i+=8) bytes.push(parseInt(bits.slice(i,i+8),2));
-  const key = Buffer.from(bytes);
-  const t = Math.floor(Date.now()/30000) + offset;
-  const tb = Buffer.alloc(8);
-  tb.writeUInt32BE(Math.floor(t/0x100000000),0); tb.writeUInt32BE(t>>>0,4);
-  const hmac = crypto.createHmac('sha1',key).update(tb).digest();
-  const off = hmac[hmac.length-1] & 0x0f;
-  const code = (((hmac[off]&0x7f)<<24)|((hmac[off+1]&0xff)<<16)|((hmac[off+2]&0xff)<<8)|(hmac[off+3]&0xff)) % 1000000;
-  return code.toString().padStart(6,'0');
-}
+  for (let i = 0; i + 8 <= bits.length; i += 8)
+    bytes.push(parseInt(bits.slice(i, i + 8), 2));
+  const key  = Buffer.from(bytes);
+  const t    = Math.floor(Date.now() / 1000 / 30) + (offset || 0);
+  const tb   = Buffer.alloc(8);
+  tb.writeUInt32BE(Math.floor(t / 0x100000000), 0);
+  tb.writeUInt32BE(t >>> 0, 4);
+  const hmac = crypto.createHmac('sha1', key).update(tb).digest();
+  const off  = hmac[hmac.length - 1] & 0xf;
+  const code = (
+    (hmac[off]     & 0x7f) << 24 |
+    (hmac[off + 1] & 0xff) << 16 |
+    (hmac[off + 2] & 0xff) << 8  |
+    (hmac[off + 3] & 0xff)
+  ) % 1000000;
+  return code.toString().padStart(6, '0');
+} // FIX #9: function closed
 
-const buildHeaders = (jwt) => ({
-  'Content-Type': 'application/json', 'Accept': 'application/json',
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-  'X-UserType': 'USER', 'X-SourceID': 'WEB',
-  'X-ClientLocalIP': '192.168.1.5', 'X-ClientPublicIP': '74.220.52.100',
-  'X-MACAddress': '00:1A:2B:3C:4D:5E', 'X-PrivateKey': API_KEY,
-  ...(jwt ? { Authorization: 'Bearer ' + jwt } : {}),
+// ───────────────────────────────────────────────────────────────
+// AUTH — FIX #10: all blocks properly closed
+// ───────────────────────────────────────────────────────────────
+let JWT = null, JWT_EXP = 0;
+
+const HDR = (jwt) => ({
+  'Content-Type':      'application/json',
+  'Accept':            'application/json',
+  'X-UserType':        'USER',
+  'X-SourceID':        'WEB',
+  'X-ClientLocalIP':   '127.0.0.1',
+  'X-ClientPublicIP':  '74.220.52.100',
+  'X-MACAddress':      'fe:80:00:00:00:00',
+  'X-PrivateKey':      API_KEY,
+  ...(jwt ? { 'Authorization': 'Bearer ' + jwt } : {}),
 });
 
 async function login() {
-  if (JWT && Date.now() < JWT_EXP) return { jwt: JWT, feedToken };
-  JWT = null; JWT_EXP = 0; feedToken = null;
-  for (const offset of [-2,-1,0,1,2]) {
-    const totp = generateTOTP(TOTP_SECRET, offset);
+  if (JWT && Date.now() < JWT_EXP) return JWT;
+  JWT = null; JWT_EXP = 0;
+  for (const w of [-4, -3, -2, -1, 0, 1, 2, 3, 4]) {
+    const pin = generateTOTP(TOTP_SECRET, w);
     try {
-      const r = await makeAxios(true).post(
+      const r = await axios.post(
         'https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword',
-        { clientcode: CLIENT_ID, password: ANGEL_PIN, totp },
-        { headers: buildHeaders(), timeout: 10000 }
+        { clientcode: CLIENT_ID, password: ANGEL_PIN, totp: pin },
+        { headers: HDR(), timeout: 10000 }
       );
-      if (r.data?.status === true && r.data?.data?.jwtToken) {
-        JWT       = r.data.data.jwtToken;
-        feedToken = r.data.data.feedToken || null;
-        JWT_EXP   = Date.now() + 6 * 60 * 60 * 1000;
-        console.log(`✅ Angel login OK (offset ${offset}), feedToken: ${feedToken ? 'yes' : 'no'}`);
-        return { jwt: JWT, feedToken };
-      }
-    } catch (e) { console.warn(`⚠️ login offset ${offset}:`, e.message); }
-  }
-  throw new Error('Angel login failed all TOTP offsets');
-}
+      if (r.data.status && r.data.data?.jwtToken) {
+        JWT     = r.data.data.jwtToken;
+        JWT_EXP = Date.now() + 6 * 60 * 60 * 1000;
+        console.log('[AUTH] Login OK window=' + w);
+        return JWT;
+      } // FIX #10: if-block closed
+    } catch (e) { /* try next TOTP window */ }
+  } // FIX #10: for-loop closed
+  throw new Error('Angel login failed - check credentials / IP whitelist');
+} // FIX #10: function closed
 
-// ═══════════════════════════════════════
-// ANGEL SMARTAPI WEBSOCKET (per-second ticks)
-// ═══════════════════════════════════════
-function parseTick(buf) {
-  // Angel SmartAPI WebSocket V2 binary format — VERIFIED from official SDK:
-  // github.com/angel-one/smartapi-python/blob/main/SmartApi/smartWebSocketV2.py
-  // ALL multi-byte fields are LITTLE ENDIAN
+// ───────────────────────────────────────────────────────────────
+// ANGEL API HELPERS — FIX #11 #12: try/catch properly closed
+// ───────────────────────────────────────────────────────────────
+async function searchScrip(jwt, q) {
   try {
-    if (!Buffer.isBuffer(buf) && !(buf instanceof ArrayBuffer)) return null;
-    const data = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-    if (data.length < 123) return null; // QUOTE/SNAP_QUOTE min size
-
-    // subscription_mode: byte 0 (uint8)
-    const subMode = data.readUInt8(0);
-    if (subMode === 0) return null; // control frame
-
-    // token: bytes 2–26 (25 bytes, null-padded string)
-    const tokenRaw = data.slice(2, 27);
-    let token = '';
-    for (let i = 0; i < tokenRaw.length; i++) {
-      if (tokenRaw[i] === 0) break;
-      token += String.fromCharCode(tokenRaw[i]);
-    }
-    if (!token) return null;
-
-    // All price fields: int64 LE, divide by 100
-    // last_traded_price: bytes 43–50
-    const ltp   = Number(data.readBigInt64LE(43)) / 100;
-    if (ltp <= 0) return null;
-
-    // QUOTE & SNAP_QUOTE fields (mode 2 & 3):
-    // open:  bytes 91–98
-    // high:  bytes 99–106
-    // low:   bytes 107–114
-    // close: bytes 115–122
-    const open  = Number(data.readBigInt64LE(91))  / 100;
-    const high  = Number(data.readBigInt64LE(99))  / 100;
-    const low   = Number(data.readBigInt64LE(107)) / 100;
-    const close = Number(data.readBigInt64LE(115)) / 100;
-
-    // SNAP_QUOTE best5 data starts at byte 147
-    // Each entry: 2(flag) + 8(qty) + 8(price) + 2(orders) = 20 bytes
-    // best_5_buy[0].price  → 147 + 0*20 + 10 = 157, 8 bytes LE int64
-    // best_5_sell[0].price → 147 + 5*20 + 10 = 257, 8 bytes LE int64
-    let bid = 0, ask = 0;
-    if (data.length >= 379 && subMode === 3) {
-      try {
-        bid = Number(data.readBigInt64LE(157)) / 100;
-        ask = Number(data.readBigInt64LE(257)) / 100;
-      } catch(e) { bid = 0; ask = 0; }
-    }
-    // Fallback bid/ask from LTP ±spread if best5 not available
-    if (bid <= 0) bid = 0;
-    if (ask <= 0) ask = 0;
-
-    return { token, ltp, open, high, low, close, bid, ask, ts: Date.now() };
-  } catch(e) { return null; }
-}
-
-function buildSubscribeMsg(tokens) {
-  // exchangeType 5 = MCX
-  return JSON.stringify({
-    correlationID: 'rr_mcx',
-    action: 1,
-    params: {
-      mode: 3,  // SNAP_QUOTE (has OHLC + bid/ask)
-      tokenList: [{ exchangeType: 5, tokens }]
-    }
-  });
-}
-
-function pushSSE(data) {
-  const msg = `data: ${JSON.stringify(data)}\n\n`;
-  for (const client of sseClients) {
-    try { client.write(msg); } catch(e) { sseClients.delete(client); }
+    const r = await axios.post(
+      'https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/searchScrip',
+      { exchange: 'MCX', searchscrip: q },
+      { headers: HDR(jwt), timeout: 8000 }
+    );
+    return r.data.data || [];
+  } catch (e) {
+    console.log('[SEARCH] error "' + q + '": ' + e.message.slice(0, 60));
+    return [];
   }
-}
+} // FIX #11
 
-async function connectAngelWS() {
-  if (wsConn && (wsConn.readyState === WebSocket.CONNECTING || wsConn.readyState === WebSocket.OPEN)) return;
-  if (!isWeekday()) { console.log('📅 Sunday — skip WS'); return; }
-
+async function getQuote(jwt, symboltoken) {
   try {
-    await ensureCache();
-    const gC = getDynamicContracts('GOLD');
-    const sC = getDynamicContracts('SILVER');
-    if (!gC.length || !sC.length) { console.warn('⚠️ No contracts found'); scheduleWsReconnect(30000); return; }
-
-    const { jwt, feedToken: ft } = await login();
-    if (!ft) { console.warn('⚠️ No feedToken — WS unavailable, falling back to REST poll'); startRestFallbackPoll(); return; }
-
-    const gCurTok  = tokenCache.GOLD[gC[0]];
-    const gNxtTok  = gC[1] ? tokenCache.GOLD[gC[1]] : null;
-    const sCurTok  = tokenCache.SILVER[sC[0]];
-    const sNxtTok  = sC[1] ? tokenCache.SILVER[sC[1]] : null;
-
-    tokenMap = {};
-    activeTokens = [];
-    for (const [t, label] of [
-      [gCurTok, 'GOLD_CUR'], [gNxtTok, 'GOLD_NXT'],
-      [sCurTok, 'SILVER_CUR'], [sNxtTok, 'SILVER_NXT']
-    ]) {
-      if (t) { tokenMap[t.symboltoken] = label; activeTokens.push(t.symboltoken); }
-    }
-
-    console.log(`🔌 Connecting Angel WS, tokens: ${activeTokens}`);
-    const ws = new WebSocket('wss://smartapisocket.angelone.in/smart-stream', {
-      headers: {
-        Authorization: jwt,
-        'x-api-key': API_KEY,
-        'x-client-code': CLIENT_ID,
-        'x-feed-token': ft,
-      }
-    });
-
-    ws.on('open', () => {
-      console.log('✅ Angel WS connected');
-      wsConnected = true;
-      ws.send(buildSubscribeMsg(activeTokens));
-      // Heartbeat every 25s
-      ws._pingTimer = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) ws.send('ping');
-      }, 10000);  // Angel heartbeat every 10s
-    });
-
-    let _dbgTickCount = 0;
-    ws.on('message', (raw) => {
-      lastWsTick = Date.now();
-      // Angel sends string ('pong' or JSON ack) or binary (tick data)
-      if (typeof raw === 'string') {
-        if (raw !== 'pong') console.log('WS string msg:', raw.slice(0,120));
-        return;
-      }
-      const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
-      if (buf[0] === 123) { // '{' = JSON ack
-        try { console.log('WS JSON:', buf.toString().slice(0,120)); } catch(e) {}
-        return;
-      }
-      const tick = parseTick(buf);
-      if (_dbgTickCount < 3) {
-        console.log(`[TICK#${_dbgTickCount}] len=${buf.length} token="${tick?.token}" ltp=${tick?.ltp} open=${tick?.open} high=${tick?.high} low=${tick?.low}`);
-        _dbgTickCount++;
-      }
-      if (!tick || tick.ltp <= 0) return;
-      const label = tokenMap[tick.token];
-      if (!label) {
-        if (_dbgTickCount <= 3) console.log(`[TICK] No label for token "${tick.token}" — known tokens:`, Object.keys(tokenMap).slice(0,6));
-        return;
-      }
-      tickStore[tick.token] = tick;
-      pushSSE(buildRatesPayload()); // push SSE on every tick
-    });
-
-    ws.on('error', (e) => { console.error('❌ Angel WS error:', e.message); wsConnected = false; });
-    ws.on('close', (code, reason) => {
-      console.warn(`⚠️ Angel WS closed: ${code} ${reason}`);
-      wsConnected = false;
-      clearInterval(ws._pingTimer);
-      scheduleWsReconnect(5000);
-    });
-    ws.on('pong', () => { lastWsTick = Date.now(); });
-
-    wsConn = ws;
-  } catch(e) {
-    console.error('❌ connectAngelWS:', e.message);
-    scheduleWsReconnect(15000);
-  }
-}
-
-function scheduleWsReconnect(delay = 5000) {
-  clearTimeout(wsReconnectTimer);
-  wsReconnectTimer = setTimeout(() => { connectAngelWS(); }, delay);
-}
-
-// ═══════════════════════════════════════
-// REST FALLBACK POLL (if no feedToken)
-// ═══════════════════════════════════════
-let restPollTimer = null;
-
-async function getBulkQuotes(jwt, tokens) {
-  const unique = [...new Set(tokens.filter(Boolean).map(String))];
-  if (!unique.length) return {};
-  const r = await makeAxios(true).post(
-    'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/',
-    { mode: 'FULL', exchangeTokens: { MCX: unique } },
-    { headers: buildHeaders(jwt), timeout: 10000 }
-  );
-  const out = {};
-  for (const d of (r.data?.data?.fetched || [])) {
-    out[String(d.symbolToken)] = {
-      ltp:   Number(d.ltp)                     || 0,
-      bid:   Number(d.depth?.buy?.[0]?.price)  || Number(d.ltp) || 0,
-      ask:   Number(d.depth?.sell?.[0]?.price) || Number(d.ltp) || 0,
-      high:  Number(d.high)                    || 0,
-      low:   Number(d.low)                     || 0,
-      open:  Number(d.open)                    || 0,
-      close: Number(d.close)                   || 0,
-      ts:    Date.now()
+    const r = await axios.post(
+      'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/',
+      { mode: 'FULL', exchangeTokens: { MCX: [String(symboltoken)] } },
+      { headers: HDR(jwt), timeout: 8000 }
+    );
+    const d = r.data.data?.fetched?.[0] || {};
+    return {
+      ltp:  Number(d.ltp)                      || 0,
+      bid:  Number(d.depth?.buy?.[0]?.price)   || Number(d.ltp) || 0,
+      ask:  Number(d.depth?.sell?.[0]?.price)  || Number(d.ltp) || 0,
+      high: Number(d.high)                     || 0,
+      low:  Number(d.low)                      || 0,
+      open: Number(d.open)                     || 0,
     };
+  } catch (e) {
+    console.log('[QUOTE] error token ' + symboltoken + ': ' + e.message.slice(0, 60));
+    return null;
   }
-  return out;
-}
+} // FIX #12
 
-function isValidQuote(q) { return q && q.ltp > 100; }
-
-function roundQuote(q) {
-  if (!q || !isValidQuote(q)) return null;
-  return {
-    ltp:   Math.round(q.ltp),
-    bid:   Math.round(q.bid)   || null,
-    ask:   Math.round(q.ask)   || null,
-    high:  q.high  > 0 ? Math.round(q.high)  : null,
-    low:   q.low   > 0 ? Math.round(q.low)   : null,
-    open:  q.open  > 0 ? Math.round(q.open)  : null,
-    close: q.close > 0 ? Math.round(q.close) : null,
-  };
-}
-
-async function restPollOnce() {
+// ───────────────────────────────────────────────────────────────
+// SPOT RATES — FIX #13 + #18: try/catch closed, frankfurter replaced
+// ───────────────────────────────────────────────────────────────
+async function getSpotRates() {
+  // Source 1: metals.live
   try {
-    await ensureCache();
-    const gC = getDynamicContracts('GOLD');
-    const sC = getDynamicContracts('SILVER');
-    if (!gC.length || !sC.length) return;
-    const { jwt } = await login();
-    const gCurTok = tokenCache.GOLD[gC[0]];
-    const gNxtTok = gC[1] ? tokenCache.GOLD[gC[1]] : null;
-    const sCurTok = tokenCache.SILVER[sC[0]];
-    const sNxtTok = sC[1] ? tokenCache.SILVER[sC[1]] : null;
-    tokenMap = {};
-    activeTokens = [];
-    for (const [t, label] of [[gCurTok,'GOLD_CUR'],[gNxtTok,'GOLD_NXT'],[sCurTok,'SILVER_CUR'],[sNxtTok,'SILVER_NXT']]) {
-      if (t) { tokenMap[t.symboltoken] = label; activeTokens.push(t.symboltoken); }
+    const r = await axios.get('https://api.metals.live/v1/spot/gold,silver', { timeout: 6000 });
+    if (Array.isArray(r.data)) {
+      const gold   = r.data.find(x => x.gold)?.gold;
+      const silver = r.data.find(x => x.silver)?.silver;
+      if (gold > 2000 && gold < 10000 && silver > 20 && silver < 500) {
+        console.log('[SPOT] metals.live ok: xau=' + gold + ' xag=' + silver);
+        return { xauUsd: gold, xagUsd: silver, src: 'metals.live' };
+      }
     }
-    const quotes = await getBulkQuotes(jwt, activeTokens);
-    for (const [tok, q] of Object.entries(quotes)) {
-      if (isValidQuote(q)) tickStore[tok] = q;
-    }
-    pushSSE(buildRatesPayload());
-  } catch(e) { console.error('❌ restPollOnce:', e.message); }
-}
+  } catch (e) { console.log('[SPOT] metals.live fail'); } // FIX #13
 
-function startRestFallbackPoll() {
-  clearInterval(restPollTimer);
-  console.log('🔄 Starting REST fallback poll (5s interval)');
-  restPollOnce();
-  restPollTimer = setInterval(restPollOnce, 5000);
-}
-
-// ═══════════════════════════════════════
-// SPOT RATES (poll every 30s)
-// ═══════════════════════════════════════
-async function getForex() {
+  // Source 2: goldprice.org
   try {
-    const r = await axios.get('https://api.exchangerate-api.com/v4/latest/USD', { timeout: 5000 });
-    const v = r.data?.rates?.INR;
-    if (v && v > 70) return v;
-  } catch(e) {}
-  return 84.5;
-}
-
-async function refreshSpotRates() {
-  try {
-    // Primary: gold-api.com
-    const [gRes, sRes] = await Promise.all([
-      axios.get('https://api.gold-api.com/price/XAU/INR', { timeout: 7000 }),
-      axios.get('https://api.gold-api.com/price/XAG/INR', { timeout: 7000 }),
-    ]);
-    const xauInrPerOz = gRes.data?.price;
-    const xagInrPerOz = sRes.data?.price;
-    const usdInr      = gRes.data?.exchangeRate;
-    const xauUsd      = xauInrPerOz / usdInr;
-    const xagUsd      = xagInrPerOz / usdInr;
-    // high/low from gold-api if available
-    const xauUsdHigh = gRes.data?.high_price ? gRes.data.high_price / usdInr : null;
-    const xauUsdLow  = gRes.data?.low_price  ? gRes.data.low_price  / usdInr : null;
-    const xagUsdHigh = sRes.data?.high_price ? sRes.data.high_price / usdInr : null;
-    const xagUsdLow  = sRes.data?.low_price  ? sRes.data.low_price  / usdInr : null;
-    if (xauInrPerOz > 50000 && xagInrPerOz > 500 && usdInr > 70) {
-      spotStore = { xauUsd, xagUsd, xauInrPerOz, xagInrPerOz, usdInr,
-        xauUsdHigh, xauUsdLow, xagUsdHigh, xagUsdLow,
-        usdInrHigh: null, usdInrLow: null, src: 'gold-api.com', ts: Date.now() };
-      return;
-    }
-  } catch(e) {}
-
-  try {
-    // Secondary: goldprice.org (has H/L)
-    const r = await axios.get('https://data-asg.goldprice.org/dbXRates/INR', {
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://goldprice.org' }, timeout: 7000
+    const r = await axios.get('https://data-asg.goldprice.org/dbXRates/USD', {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://goldprice.org/', 'Accept': 'application/json' },
+      timeout: 8000,
     });
-    const item = r.data?.items?.[0];
-    const xauInrPerOz = item?.xauPrice;
-    const xagInrPerOz = item?.xagPrice;
-    const usdInr      = item?.usdInr || 84.5;
-    const xauUsd      = xauInrPerOz / usdInr;
-    const xagUsd      = xagInrPerOz / usdInr;
-    if (xauInrPerOz > 50000 && xagInrPerOz > 500) {
-      spotStore = { xauUsd, xagUsd, xauInrPerOz, xagInrPerOz, usdInr,
-        xauUsdHigh: item?.xauHighPrice ? item.xauHighPrice / usdInr : null,
-        xauUsdLow:  item?.xauLowPrice  ? item.xauLowPrice  / usdInr : null,
-        xagUsdHigh: item?.xagHighPrice ? item.xagHighPrice / usdInr : null,
-        xagUsdLow:  item?.xagLowPrice  ? item.xagLowPrice  / usdInr : null,
-        usdInrHigh: null, usdInrLow: null, src: 'goldprice.org', ts: Date.now() };
-      return;
+    const gold   = r.data?.items?.[0]?.xauPrice;
+    const silver = r.data?.items?.[0]?.xagPrice;
+    if (gold > 2000 && gold < 10000 && silver > 20 && silver < 500) {
+      console.log('[SPOT] goldprice.org ok: xau=' + gold + ' xag=' + silver);
+      return { xauUsd: gold, xagUsd: silver, src: 'goldprice.org' };
     }
-  } catch(e) {}
-}
+  } catch (e) { console.log('[SPOT] goldprice.org fail'); } // FIX #13
 
-// ═══════════════════════════════════════
-// BUILD RATES PAYLOAD (from tickStore)
-// ═══════════════════════════════════════
-function getTickByLabel(label) {
-  for (const [tok, lb] of Object.entries(tokenMap)) {
-    if (lb === label) return tickStore[tok] || null;
-  }
-  return null;
-}
-
-function fromSpotToMcx(sp) {
-  const f = PREMIUM_FACTOR;
-  if (!sp.xauUsd || !sp.usdInr) return { goldPer10g: null, silverPerKg: null };
-  return {
-    goldPer10g:  Math.round((sp.xauUsd / 31.1035) * 10 * sp.usdInr * f),
-    silverPerKg: Math.round(sp.xagUsd * sp.usdInr * 1000 / 31.1035 * f),
-  };
-}
-
-function buildRatesPayload() {
-  const gCurr = getTickByLabel('GOLD_CUR');
-  const sCurr = getTickByLabel('SILVER_CUR');
-  const gNext = getTickByLabel('GOLD_NXT');
-  const sNext = getTickByLabel('SILVER_NXT');
-  const mcxLive = !!(gCurr && isValidQuote(gCurr) && sCurr && isValidQuote(sCurr));
-  const source = mcxLive ? 'mcx_live' : 'mcx_unavailable';
-  const sp = spotStore;
-  const derived = fromSpotToMcx(sp);
-  const gKeys = Object.keys(tokenCache.GOLD || {});
-  const sKeys = Object.keys(tokenCache.SILVER || {});
-  return {
-    success: true, source,
-    weekdaySession: isWeekday(),
-    isHoliday: isMCXHoliday(),
-    wsConnected,
-    usdInr:     sp.usdInr      ? parseFloat(sp.usdInr.toFixed(4))   : null,
-    xauUsd:     sp.xauUsd      ? parseFloat(sp.xauUsd.toFixed(2))    : null,
-    xagUsd:     sp.xagUsd      ? parseFloat(sp.xagUsd.toFixed(4))    : null,
-    spotSource: sp.src,
-    spot: {
-      xauUsd:      sp.xauUsd      ? parseFloat(sp.xauUsd.toFixed(2))    : null,
-      xagUsd:      sp.xagUsd      ? parseFloat(sp.xagUsd.toFixed(4))    : null,
-      xauInrPerOz: sp.xauInrPerOz ? Math.round(sp.xauInrPerOz)          : null,
-      xagInrPerOz: sp.xagInrPerOz ? Math.round(sp.xagInrPerOz)          : null,
-      xauUsdHigh:  sp.xauUsdHigh  ? parseFloat(sp.xauUsdHigh.toFixed(2)) : null,
-      xauUsdLow:   sp.xauUsdLow   ? parseFloat(sp.xauUsdLow.toFixed(2))  : null,
-      xagUsdHigh:  sp.xagUsdHigh  ? parseFloat(sp.xagUsdHigh.toFixed(4)) : null,
-      xagUsdLow:   sp.xagUsdLow   ? parseFloat(sp.xagUsdLow.toFixed(4))  : null,
-      usdInrHigh:  sp.usdInrHigh  ? parseFloat(sp.usdInrHigh.toFixed(4)) : null,
-      usdInrLow:   sp.usdInrLow   ? parseFloat(sp.usdInrLow.toFixed(4))  : null,
-    },
-    derivedFromSpot: derived,
-    goldPer10g:  mcxLive && gCurr ? Math.round(gCurr.ltp) : null,
-    silverPerKg: mcxLive && sCurr ? Math.round(sCurr.ltp) : null,
-    futures: {
-      gold:       roundQuote(gCurr),
-      silver:     roundQuote(sCurr),
-      goldNext:   roundQuote(gNext),
-      silverNext: roundQuote(sNext),
-    },
-    contracts: {
-      gold:   { current: gKeys[0]||null, next: gKeys[1]||null },
-      silver: { current: sKeys[0]||null, next: sKeys[1]||null },
-    },
-    _debug: { wsConnected, lastWsTick, wsMode: feedToken ? 'websocket' : 'rest_poll' },
-    timestamp: new Date().toISOString(),
-  };
-}
-
-// ═══════════════════════════════════════
-// ROUTES
-// ═══════════════════════════════════════
-
-// Health
-app.get('/', (req, res) => res.json({ status: 'R.R Jewellers Server v24 ✅', wsConnected, timestamp: new Date().toISOString() }));
-app.get('/ping', (req, res) => res.json({ ok: true }));
-
-// REST rates (instant from cache)
-app.get('/rates', async (req, res) => {
+  // Source 3: gold-api.com (FIX #18: replaces fxratesapi which inverts badly)
   try {
-    res.json(buildRatesPayload());
-  } catch(e) {
-    res.status(500).json({ success: false, source: 'error', error: e.message });
+    const [gR, sR] = await Promise.all([
+      axios.get('https://www.gold-api.com/price/XAU', { timeout: 6000 }),
+      axios.get('https://www.gold-api.com/price/XAG', { timeout: 6000 }),
+    ]);
+    const xauUsd = gR.data?.price;
+    const xagUsd = sR.data?.price;
+    if (xauUsd > 2000 && xauUsd < 10000 && xagUsd > 20 && xagUsd < 500) {
+      console.log('[SPOT] gold-api.com ok: xau=' + xauUsd + ' xag=' + xagUsd);
+      return { xauUsd, xagUsd, src: 'gold-api.com' };
+    }
+  } catch (e) { console.log('[SPOT] gold-api.com fail'); } // FIX #13
+
+  console.log('[SPOT] All sources failed - using fixed fallback');
+  return { xauUsd: 3330, xagUsd: 33.0, src: 'fixed_fallback' };
+}
+
+// ───────────────────────────────────────────────────────────────
+// FOREX — FIX #14 + #18: frankfurter replaced with reliable sources
+// ───────────────────────────────────────────────────────────────
+async function getForex() {
+  const FX_MIN = 82, FX_MAX = 88;
+
+  // Source 1: open.er-api (free, no key, reliable INR data)
+  try {
+    const r    = await axios.get('https://open.er-api.com/v6/latest/USD', { timeout: 5000 });
+    const rate = r.data?.rates?.INR;
+    if (rate > FX_MIN && rate < FX_MAX) { console.log('[FOREX] open.er-api: ' + rate); return rate; }
+    else console.log('[FOREX] open.er-api out-of-range: ' + rate);
+  } catch (e) { console.log('[FOREX] open.er-api fail'); } // FIX #14
+
+  // Source 2: exchangerate-api.com
+  try {
+    const r    = await axios.get('https://api.exchangerate-api.com/v4/latest/USD', { timeout: 5000 });
+    const rate = r.data?.rates?.INR;
+    if (rate > FX_MIN && rate < FX_MAX) { console.log('[FOREX] exchangerate-api: ' + rate); return rate; }
+    else console.log('[FOREX] exchangerate-api out-of-range: ' + rate);
+  } catch (e) { console.log('[FOREX] exchangerate-api fail'); } // FIX #14
+
+  // Source 3: gold-api.com INR (FIX #18: replaces non-functional frankfurter)
+  try {
+    const r    = await axios.get('https://www.gold-api.com/price/XAU?currency=INR', { timeout: 5000 });
+    const xauInr = r.data?.price;
+    // Derive USD/INR: XAU/INR ÷ XAU/USD (use ~3330 as approx XAU/USD)
+    if (xauInr > 200000) {
+      const derived = parseFloat((xauInr / 3330).toFixed(2));
+      if (derived > FX_MIN && derived < FX_MAX) {
+        console.log('[FOREX] gold-api derived INR: ' + derived);
+        return derived;
+      }
+    }
+  } catch (e) { console.log('[FOREX] gold-api INR fail'); } // FIX #14 #18
+
+  console.log('[FOREX] All failed - using hardcoded 84.50');
+  return 84.50;
+}
+
+async function getSpotDerivedRates() {
+  try {
+    const [spot, usdInr] = await Promise.all([getSpotRates(), getForex()]);
+    const goldPer10g  = Math.round((spot.xauUsd / 31.1035) * 10   * usdInr * 1.103);
+    const silverPerKg = Math.round((spot.xagUsd / 31.1035) * 1000 * usdInr * 1.103);
+    console.log('[SPOT_DERIVED] usdInr=' + usdInr + ' xau=' + spot.xauUsd + ' gold=' + goldPer10g + ' silver=' + silverPerKg);
+    return { goldPer10g, silverPerKg, spotSrc: spot.src, usdInr };
+  } catch (e) {
+    console.log('[SPOT_DERIVED] failed:', e.message);
+    return null;
+  }
+} // FIX #15
+
+// ───────────────────────────────────────────────────────────────
+// ROUTES
+// ───────────────────────────────────────────────────────────────
+app.get('/', (req, res) => res.json({
+  server:          'RR Jewellers Gold Server v14 - PRODUCTION',
+  endpoints:       ['/rates', '/debug', '/cache-status', '/login-test', '/spot-test', '/forex-test', '/updates'],
+  cacheBuilt:      cacheBuiltAt ? new Date(cacheBuiltAt).toISOString() : 'not yet',
+  mcxOpen:         isMCXOpen(),
+  lastRateAt:      lastKnownRates?.timestamp || null,
+  goldContracts:   getContracts(GOLD_M),
+  silverContracts: getContracts(SILVER_M),
+  ist: (() => { const i = getIST(); return i.year+'-'+(i.month+1)+'-'+i.day+' '+i.hour+':'+String(i.min).padStart(2,'0')+' IST'; })(),
+}));
+
+// FIX #16: catch block properly closed
+app.get('/login-test', async (req, res) => {
+  try {
+    const jwt = await login();
+    res.json({ success: true, preview: jwt.slice(0, 20) + '...' });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  } // FIX #16
+});
+
+app.get('/forex-test', async (req, res) => {
+  const rate = await getForex();
+  res.json({ usdInr: rate, note: 'Valid range: 82-88. Fallback: 84.50' });
+});
+
+app.get('/spot-test', async (req, res) => {
+  try {
+    const [spot, usdInr] = await Promise.all([getSpotRates(), getForex()]);
+    const g = Math.round((spot.xauUsd / 31.1035) * 10   * usdInr * 1.103);
+    const s = Math.round((spot.xagUsd / 31.1035) * 1000 * usdInr * 1.103);
+    res.json({ spot, usdInr, goldMCX_approx: g, silverMCX_approx: s });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-// SSE stream — push on every tick
-app.get('/stream', (req, res) => {
-  res.setHeader('Content-Type',  'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection',    'keep-alive');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.flushHeaders();
-
-  // Send current state immediately
-  res.write(`data: ${JSON.stringify(buildRatesPayload())}\n\n`);
-
-  sseClients.add(res);
-  console.log(`📡 SSE client connected (total: ${sseClients.size})`);
-
-  // Keep alive ping every 20s
-  const keepAlive = setInterval(() => {
-    try { res.write(': ping\n\n'); } catch(e) {}
-  }, 20000);
-
-  req.on('close', () => {
-    sseClients.delete(res);
-    clearInterval(keepAlive);
-    console.log(`📡 SSE client disconnected (total: ${sseClients.size})`);
-  });
-});
-
-// Debug
-app.get('/debug', async (req, res) => {
+app.get('/cache-status', async (req, res) => {
   await ensureCache();
+  const gKeys = Object.keys(tokenCache['GOLD']   || {}).sort();
+  const sKeys = Object.keys(tokenCache['SILVER'] || {}).sort();
   res.json({
-    weekdaySession: isWeekday(), isHoliday: isMCXHoliday(),
-    wsConnected, lastWsTick: lastWsTick ? new Date(lastWsTick).toISOString() : null,
-    wsMode: feedToken ? 'websocket' : 'rest_poll',
-    sseClients: sseClients.size,
-    tickStoreKeys: Object.keys(tickStore),
-    tokenMap, activeTokens,
-    cacheSize: { gold: Object.keys(tokenCache.GOLD).length, silver: Object.keys(tokenCache.SILVER).length },
+    cacheBuiltAt:    cacheBuiltAt ? new Date(cacheBuiltAt).toISOString() : null,
+    goldContracts:   gKeys.map(k => ({ label: k, ...tokenCache['GOLD'][k] })),
+    silverContracts: sKeys.map(k => ({ label: k, ...tokenCache['SILVER'][k] })),
+    activeGold:      getContracts(GOLD_M),
+    activeSilver:    getContracts(SILVER_M),
   });
 });
 
-// Updates (Google Sheets)
+app.get('/debug', async (req, res) => {
+  try {
+    const jwt = await login();
+    const gC  = getContracts(GOLD_M);
+    const sC  = getContracts(SILVER_M);
+    const [gTok, sTok] = await Promise.all([
+      findToken(jwt, 'GOLD',   gC[0]),
+      findToken(jwt, 'SILVER', sC[0]),
+    ]);
+    const [gRaw, sRaw] = await Promise.all([
+      searchScrip(jwt, 'GOLD'),
+      searchScrip(jwt, 'SILVER'),
+    ]);
+    res.json({
+      wantedContracts:  { gold: gC, silver: sC },
+      goldTokenFound:   gTok,
+      silverTokenFound: sTok,
+      goldRawSearch:    gRaw.map(r => ({ sym: r.tradingsymbol, tok: r.symboltoken })),
+      silverRawSearch:  sRaw.map(r => ({ sym: r.tradingsymbol, tok: r.symboltoken })),
+      cacheGoldKeys:    Object.keys(tokenCache['GOLD']   || {}),
+      cacheSilverKeys:  Object.keys(tokenCache['SILVER'] || {}),
+      mcxOpen:          isMCXOpen(),
+      lastKnownRatesAt: lastKnownRates?.timestamp || null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/updates', async (req, res) => {
   try {
-    if (!SHEET_ID) throw new Error('SHEET_ID not set');
-    const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=Sheet1`;
-    const r = await axios.get(url, { timeout: 8000 });
-    const json = JSON.parse(r.data.replace(/^[^(]+\(|\);?$/g, ''));
-    const rows = (json.table?.rows || []).map(row => ({
-      title:   row.c[0]?.v || '', content: row.c[1]?.v || '',
-      date:    row.c[2]?.v || '', active:  row.c[3]?.v !== false,
+    if (!SHEET_ID) throw new Error('SHEET_ID env not set');
+    const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=Updates`;
+    const r   = await axios.get(url, { timeout: 8000 });
+    const json = r.data.replace(/.*?({.*}).*/s, '$1');
+    const data = JSON.parse(json);
+    const rows = data.table.rows.map(row => ({
+      date:    row.c[0]?.v || '',
+      title:   row.c[1]?.v || '',
+      content: row.c[2]?.v || '',
+      image:   row.c[3]?.v || '',
     }));
     res.json({ success: true, updates: rows.filter(r => r.title) });
-  } catch(e) {
-    res.json({ success: true, updates: [{ title: 'Welcome to R.R. Jewellers', content: 'Your trusted jewellers in Etawah since 1982.', date: '', active: true }] });
+  } catch (e) {
+    res.json({ success: true, updates: [{
+      date: 'Today', title: 'Welcome to R.R. Jewellers',
+      content: 'Live gold & silver rates. Contact us for best prices!', image: '',
+    }]});
   }
 });
 
-// ═══════════════════════════════════════
-// STARTUP
-// ═══════════════════════════════════════
-async function startup() {
-  await buildScripCache();
-  await refreshSpotRates();
+// ───────────────────────────────────────────────────────────────
+// /rates — MAIN ENDPOINT — FIX #17: LTP=0 if-block closed
+// ───────────────────────────────────────────────────────────────
+app.get('/rates', async (req, res) => {
+  const marketOpen = isMCXOpen();
+  let liveErr = null;
 
-  // Start WebSocket connection (or REST fallback)
-  if (isWeekday()) await connectAngelWS();
+  try {
+    const jwt = await login();
+    const gC  = getContracts(GOLD_M);
+    const sC  = getContracts(SILVER_M);
+    console.log('[RATES] Contracts - GOLD:', gC, ' SILVER:', sC);
 
-  // Reconnect WS if stale (no tick for 60s during market hours)
-  setInterval(() => {
-    if (!isWeekday()) return;
-    const stale = lastWsTick && (Date.now() - lastWsTick > 60000);
-    const neverConnected = !lastWsTick && wsConnected === false;
-    if (stale || neverConnected) {
-      console.log('🔄 WS stale/dead — reconnecting...');
-      if (wsConn) { try { wsConn.terminate(); } catch(e) {} wsConn = null; }
-      wsConnected = false;
-      connectAngelWS();
+    const [gCurTok, gNxtTok, sCurTok, sNxtTok] = await Promise.all([
+      findToken(jwt, 'GOLD',   gC[0]),
+      findToken(jwt, 'GOLD',   gC[1]),
+      findToken(jwt, 'SILVER', sC[0]),
+      findToken(jwt, 'SILVER', sC[1]),
+    ]);
+
+    if (!gCurTok?.symboltoken) throw new Error('GOLD ' + gC[0] + ' token not found');
+    if (!sCurTok?.symboltoken) throw new Error('SILVER ' + sC[0] + ' token not found');
+
+    const [gCurr, sCurr, gNextRaw, sNextRaw] = await Promise.all([
+      getQuote(jwt, gCurTok.symboltoken),
+      getQuote(jwt, sCurTok.symboltoken),
+      gNxtTok?.symboltoken ? getQuote(jwt, gNxtTok.symboltoken) : Promise.resolve(null),
+      sNxtTok?.symboltoken ? getQuote(jwt, sNxtTok.symboltoken) : Promise.resolve(null),
+    ]);
+
+    if (!gCurr) throw new Error('GOLD quote network error');
+    if (!sCurr) throw new Error('SILVER quote network error');
+
+    if (gCurr.ltp === 0 || sCurr.ltp === 0) {
+      console.log('[RATES] LTP=0 received - market closed/pre-open');
+      throw new Error('LTP=0 — market may be closed');
+    } // FIX #17: if-block properly closed
+
+    const gNext = gNextRaw?.ltp > 0 ? gNextRaw : gCurr;
+    const sNext = sNextRaw?.ltp > 0 ? sNextRaw : sCurr;
+
+    const payload = {
+      success:    true,
+      source:     'angel_mcx_live',
+      marketOpen: true,
+      contracts: {
+        gold:   { current: gC[0], next: gC[1], currentSymbol: gCurTok.tradingsymbol },
+        silver: { current: sC[0], next: sC[1], currentSymbol: sCurTok.tradingsymbol },
+      },
+      goldPer10g:  Math.round(gCurr.ltp),
+      silverPerKg: Math.round(sCurr.ltp),
+      futures: {
+        gold:       { ltp: Math.round(gCurr.ltp), bid: Math.round(gCurr.bid), ask: Math.round(gCurr.ask), high: Math.round(gCurr.high), low: Math.round(gCurr.low), open: Math.round(gCurr.open) },
+        silver:     { ltp: Math.round(sCurr.ltp), bid: Math.round(sCurr.bid), ask: Math.round(sCurr.ask), high: Math.round(sCurr.high), low: Math.round(sCurr.low), open: Math.round(sCurr.open) },
+        goldNext:   { ltp: Math.round(gNext.ltp), bid: Math.round(gNext.bid), ask: Math.round(gNext.ask), high: Math.round(gNext.high || gNext.ltp * 1.003), low: Math.round(gNext.low || gNext.ltp * 0.994) },
+        silverNext: { ltp: Math.round(sNext.ltp), bid: Math.round(sNext.bid), ask: Math.round(sNext.ask), high: Math.round(sNext.high || sNext.ltp * 1.012), low: Math.round(sNext.low || sNext.ltp * 0.984) },
+      },
+      timestamp: new Date().toISOString(),
+    };
+
+    lastKnownRates = payload;
+    return res.json(payload);
+
+  } catch (err) {
+    liveErr = err;
+    console.log('[RATES] Live failed:', err.message);
+
+    if (lastKnownRates) {
+      console.log('[RATES] Using lastKnownRates from', lastKnownRates.timestamp);
+      return res.json({
+        ...lastKnownRates,
+        source:     'last_known_rates',
+        marketOpen: marketOpen,
+        note:       marketOpen ? 'Live fetch failed - showing last known MCX price' : 'MCX market closed - showing last closing price',
+        priceAsOf:  lastKnownRates.timestamp,
+        timestamp:  new Date().toISOString(),
+      });
     }
-  }, 30000);
 
-  // Spot rates refresh every 30s
-  setInterval(refreshSpotRates, 30000);
-
-  // RE-check WS every day at midnight IST (new contracts may be needed)
-  setInterval(async () => {
-    await buildScripCache();
-    if (isWeekday()) {
-      if (wsConn) { try { wsConn.terminate(); } catch(e) {} wsConn = null; }
-      wsConnected = false;
-      await connectAngelWS();
+    console.log('[RATES] No lastKnownRates - trying spot-derived...');
+    const derived = await getSpotDerivedRates();
+    if (derived) {
+      const g  = derived.goldPer10g;
+      const s  = derived.silverPerKg;
+      const gC = getContracts(GOLD_M);
+      const sC = getContracts(SILVER_M);
+      return res.json({
+        success: true, source: 'spot_derived', marketOpen,
+        note:       'MCX data unavailable - estimated from international spot rates',
+        spotSource: derived.spotSrc, usdInr: derived.usdInr,
+        contracts:  { gold: { current: gC[0], next: gC[1] }, silver: { current: sC[0], next: sC[1] } },
+        goldPer10g: g, silverPerKg: s,
+        futures: {
+          gold:       { ltp: g, bid: g, ask: g, high: 0, low: 0, open: 0 },
+          silver:     { ltp: s, bid: s, ask: s, high: 0, low: 0, open: 0 },
+          goldNext:   { ltp: g, bid: g, ask: g, high: 0, low: 0 },
+          silverNext: { ltp: s, bid: s, ask: s, high: 0, low: 0 },
+        },
+        timestamp: new Date().toISOString(),
+      });
     }
-  }, 22 * 60 * 60 * 1000);
-}
 
-// Keep-alive (Render free tier)
-setInterval(() => {
-  if (SELF_URL) axios.get(SELF_URL, { timeout: 5000 }).catch(() => {});
-}, 13 * 60 * 1000);
-
-app.listen(PORT, () => {
-  console.log(`🚀 R.R Jewellers Server v24 on port ${PORT}`);
-  startup().catch(e => console.error('❌ startup:', e.message));
+    return res.status(500).json({
+      success: false, source: 'error',
+      error:      liveErr?.message || 'All data sources failed',
+      marketOpen: marketOpen,
+      debug_url:  '/debug',
+      cache_url:  '/cache-status',
+      timestamp:  new Date().toISOString(),
+    });
+  }
 });
+
+// ───────────────────────────────────────────────────────────────
+// SERVER START — FIX #19: self-ping uses axios
+// ───────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log('═══════════════════════════════════════════');
+  console.log(' RR Jewellers Gold Server v14 - port ' + PORT);
+  console.log('═══════════════════════════════════════════');
+
+  await buildScripCache();
+
+  setInterval(async () => {
+    const utcH = new Date().getUTCHours();
+    const utcM = new Date().getUTCMinutes();
+    if ((utcH === 2 && utcM >= 30) || Date.now() - cacheBuiltAt > CACHE_TTL) {
+      await buildScripCache();
+    }
+  }, 30 * 60 * 1000);
+
+  // FIX #19: use axios instead of inline require('https')
+  setInterval(() => {
+    axios.get(SELF_URL + '/ping').catch(() => {});
+  }, 4 * 60 * 1000);
+});
+
+// /ping for self-keep-alive
+app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
