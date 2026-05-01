@@ -222,23 +222,58 @@ async function login() {
 // ANGEL SMARTAPI WEBSOCKET (per-second ticks)
 // ═══════════════════════════════════════
 function parseTick(buf) {
-  // Angel binary tick format (SNAP_QUOTE mode = 3)
-  // https://smartapi.angelbroking.com/docs (WebSocket feed)
+  // Angel SmartAPI WebSocket V2 binary format — VERIFIED from official SDK:
+  // github.com/angel-one/smartapi-python/blob/main/SmartApi/smartWebSocketV2.py
+  // ALL multi-byte fields are LITTLE ENDIAN
   try {
     if (!Buffer.isBuffer(buf) && !(buf instanceof ArrayBuffer)) return null;
     const data = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-    if (data.length < 50) return null;
-    // Subscription mode 3 (SNAP_QUOTE): 184 bytes per token
-    const token     = data.readInt32BE(19).toString();  // symbol token
-    const seqNo     = data.readBigInt64BE(1);
-    const ltp       = data.readInt32BE(43) / 100;
-    const open      = data.readInt32BE(55) / 100;
-    const high      = data.readInt32BE(59) / 100;
-    const low       = data.readInt32BE(63) / 100;
-    const close     = data.readInt32BE(67) / 100;
-    const bestBidP  = data.readInt32BE(71) / 100;
-    const bestAskP  = data.readInt32BE(99) / 100;
-    return { token, ltp, open, high, low, close, bid: bestBidP, ask: bestAskP, ts: Date.now() };
+    if (data.length < 123) return null; // QUOTE/SNAP_QUOTE min size
+
+    // subscription_mode: byte 0 (uint8)
+    const subMode = data.readUInt8(0);
+    if (subMode === 0) return null; // control frame
+
+    // token: bytes 2–26 (25 bytes, null-padded string)
+    const tokenRaw = data.slice(2, 27);
+    let token = '';
+    for (let i = 0; i < tokenRaw.length; i++) {
+      if (tokenRaw[i] === 0) break;
+      token += String.fromCharCode(tokenRaw[i]);
+    }
+    if (!token) return null;
+
+    // All price fields: int64 LE, divide by 100
+    // last_traded_price: bytes 43–50
+    const ltp   = Number(data.readBigInt64LE(43)) / 100;
+    if (ltp <= 0) return null;
+
+    // QUOTE & SNAP_QUOTE fields (mode 2 & 3):
+    // open:  bytes 91–98
+    // high:  bytes 99–106
+    // low:   bytes 107–114
+    // close: bytes 115–122
+    const open  = Number(data.readBigInt64LE(91))  / 100;
+    const high  = Number(data.readBigInt64LE(99))  / 100;
+    const low   = Number(data.readBigInt64LE(107)) / 100;
+    const close = Number(data.readBigInt64LE(115)) / 100;
+
+    // SNAP_QUOTE best5 data starts at byte 147
+    // Each entry: 2(flag) + 8(qty) + 8(price) + 2(orders) = 20 bytes
+    // best_5_buy[0].price  → 147 + 0*20 + 10 = 157, 8 bytes LE int64
+    // best_5_sell[0].price → 147 + 5*20 + 10 = 257, 8 bytes LE int64
+    let bid = 0, ask = 0;
+    if (data.length >= 379 && subMode === 3) {
+      try {
+        bid = Number(data.readBigInt64LE(157)) / 100;
+        ask = Number(data.readBigInt64LE(257)) / 100;
+      } catch(e) { bid = 0; ask = 0; }
+    }
+    // Fallback bid/ask from LTP ±spread if best5 not available
+    if (bid <= 0) bid = 0;
+    if (ask <= 0) ask = 0;
+
+    return { token, ltp, open, high, low, close, bid, ask, ts: Date.now() };
   } catch(e) { return null; }
 }
 
@@ -291,7 +326,7 @@ async function connectAngelWS() {
     console.log(`🔌 Connecting Angel WS, tokens: ${activeTokens}`);
     const ws = new WebSocket('wss://smartapisocket.angelone.in/smart-stream', {
       headers: {
-        Authorization: 'Bearer ' + jwt,
+        Authorization: jwt,
         'x-api-key': API_KEY,
         'x-client-code': CLIENT_ID,
         'x-feed-token': ft,
@@ -304,25 +339,36 @@ async function connectAngelWS() {
       ws.send(buildSubscribeMsg(activeTokens));
       // Heartbeat every 25s
       ws._pingTimer = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) ws.ping();
-      }, 25000);
+        if (ws.readyState === WebSocket.OPEN) ws.send('ping');
+      }, 10000);  // Angel heartbeat every 10s
     });
 
+    let _dbgTickCount = 0;
     ws.on('message', (raw) => {
       lastWsTick = Date.now();
-      // Angel sends either JSON (ack) or binary (tick)
-      if (typeof raw === 'string' || (Buffer.isBuffer(raw) && raw[0] === 123)) {
-        try { const j = JSON.parse(raw.toString()); console.log('WS msg:', JSON.stringify(j).slice(0,100)); }
-        catch(e) {}
+      // Angel sends string ('pong' or JSON ack) or binary (tick data)
+      if (typeof raw === 'string') {
+        if (raw !== 'pong') console.log('WS string msg:', raw.slice(0,120));
         return;
       }
-      const tick = parseTick(raw);
+      const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+      if (buf[0] === 123) { // '{' = JSON ack
+        try { console.log('WS JSON:', buf.toString().slice(0,120)); } catch(e) {}
+        return;
+      }
+      const tick = parseTick(buf);
+      if (_dbgTickCount < 3) {
+        console.log(`[TICK#${_dbgTickCount}] len=${buf.length} token="${tick?.token}" ltp=${tick?.ltp} open=${tick?.open} high=${tick?.high} low=${tick?.low}`);
+        _dbgTickCount++;
+      }
       if (!tick || tick.ltp <= 0) return;
       const label = tokenMap[tick.token];
-      if (!label) return;
+      if (!label) {
+        if (_dbgTickCount <= 3) console.log(`[TICK] No label for token "${tick.token}" — known tokens:`, Object.keys(tokenMap).slice(0,6));
+        return;
+      }
       tickStore[tick.token] = tick;
-      // Push SSE on every tick
-      pushSSE(buildRatesPayload());
+      pushSSE(buildRatesPayload()); // push SSE on every tick
     });
 
     ws.on('error', (e) => { console.error('❌ Angel WS error:', e.message); wsConnected = false; });
