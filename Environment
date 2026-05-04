@@ -1,1 +1,8 @@
-
+PORT               = 3000
+SELF_URL           = https://gold-proxy-server.onrender.com
+SHEET_ID           = [Step 2 se mila Sheet ID]
+DHAN_CLIENT_ID     = 1111521888
+DHAN_ACCESS_TOKEN  = eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc3OTgzNTc0LCJpYXQiOjE3Nzc4OTcxNzQsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTExNTIxODg4In0.Xr5w4vJG7KrTeYKTyl4IINmbkGYG7nAFx2KjvRnB8sv3xgwx7R47m8BsIOZ0IpWLvEwENEQF1sE82AGsP6_ZzQ
+DHAN_API_KEY       = bf0480d2
+DHAN_API_SECRET    = 2482b68e-5897-4a97-866b-f6ce1f83a335
+DHAN_TOTP_SECRET   = 
