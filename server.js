@@ -9,27 +9,31 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ─── ENV VARS ──────────────────────────────────────────────────────
+// ─── ENV ─────────────────────────────────────────────────────────
 const PORT              = process.env.PORT              || 3000;
 const SELF_URL          = process.env.SELF_URL          || '';
-const SHEET_ID          = process.env.SHEET_ID          || '';
 const DHAN_CLIENT_ID    = process.env.DHAN_CLIENT_ID    || '';
 const DHAN_ACCESS_TOKEN = process.env.DHAN_ACCESS_TOKEN || '';
+const DHAN_API_BASE     = 'https://api.dhan.co/v2';
 
-const DHAN_API_BASE = 'https://api.dhan.co/v2';
+// ─── FEED CODES (from Dhan docs) ──────────────────────────────────
+// 2=Ticker, 4=Quote, 5=OI, 6=PrevClose, 8=Full, 50=Disconnect
+const FC = { TICKER: 2, QUOTE: 4, OI: 5, PREV_CLOSE: 6, FULL: 8, DISCONNECT: 50 };
 
-const FEED_CODE = { TICKER: 2, QUOTE: 4, FULL: 8, DISCONNECT: 50 };
-const EXCH_SEG  = { MCX_COMM: 'MCX_COMM' };
+// ─── TOKENS ───────────────────────────────────────────────────────
+const TOKENS = {
+  '436177': { key: 'gold',       name: 'GOLD-JUN2026-MCX' },
+  '436178': { key: 'goldNext',   name: 'GOLD-AUG2026-MCX' },
+  '436197': { key: 'silver',     name: 'SILVER-JUL2026-MCX' },
+  '436198': { key: 'silverNext', name: 'SILVER-SEP2026-MCX' },
+};
 
-// ─── STATE ─────────────────────────────────────────────────────────
-let currentAccessToken = DHAN_ACCESS_TOKEN;
-let tokenRenewedAt     = null;
-
+// ─── LIVE STATE ───────────────────────────────────────────────────
 const liveTick = {
-  gold:       { ltp: 0, bid: 0, ask: 0, high: 0, low: 0, open: 0, ts: 0 },
-  silver:     { ltp: 0, bid: 0, ask: 0, high: 0, low: 0, open: 0, ts: 0 },
-  goldNext:   { ltp: 0, bid: 0, ask: 0, high: 0, low: 0, open: 0, ts: 0 },
-  silverNext: { ltp: 0, bid: 0, ask: 0, high: 0, low: 0, open: 0, ts: 0 },
+  gold:       { ltp: 0, bid: 0, ask: 0, high: 0, low: 0, open: 0, prevClose: 0, ts: 0 },
+  goldNext:   { ltp: 0, bid: 0, ask: 0, high: 0, low: 0, open: 0, prevClose: 0, ts: 0 },
+  silver:     { ltp: 0, bid: 0, ask: 0, high: 0, low: 0, open: 0, prevClose: 0, ts: 0 },
+  silverNext: { ltp: 0, bid: 0, ask: 0, high: 0, low: 0, open: 0, prevClose: 0, ts: 0 },
 };
 
 const sessionHL = {
@@ -38,428 +42,351 @@ const sessionHL = {
 };
 
 const WS = {
-  ws: null,
-  wsStatus: 'disconnected',
-  reconnectCount: 0,
-  reconnectTimer: null,
-  lastConnectAt: null,
-  lastDisconnectAt: null,
-  lastTickAt: null,
-  lastRawBufHex: '',
-  lastTextMsg: '',
-  lastDisconnectCode: null,
-};
-
-// Tokens for your four MCX contracts
-const TOKENS = {
-  goldCurrent:   { secId: '436177', symbol: 'GOLD-JUN2026-MCX-FUT' },
-  goldNext:      { secId: '436178', symbol: 'GOLD-AUG2026-MCX-FUT' },
-  silverCurrent: { secId: '436197', symbol: 'SILVER-JUL2026-MCX-FUT' },
-  silverNext:    { secId: '436198', symbol: 'SILVER-SEP2026-MCX-FUT' },
+  ws: null, status: 'disconnected',
+  reconnectCount: 0, reconnectTimer: null,
+  lastConnectAt: null, lastDisconnectAt: null,
+  lastTickAt: null, lastDisconnectCode: null,
+  lastRawBufHex: '', lastTextMsg: '',
+  packetsReceived: 0,
 };
 
 let lastKnownRates = null;
 
+// ─── FOREX CACHE ──────────────────────────────────────────────────
 const forexCache = {
-  usdInr: 94.5,
-  xauUsd: 3310,
-  xagUsd: 32.8,
-  updatedAt: null,
-  src: 'init',
+  usdInr: 94.5, xauUsd: 3310, xagUsd: 32.8,
+  updatedAt: null, src: 'init',
 };
 
-// ─── TIME HELPERS ──────────────────────────────────────────────────
-function getIST() {
-  const d = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
-  return {
-    year: d.getUTCFullYear(),
-    month: d.getUTCMonth(),
-    day: d.getUTCDate(),
-    hour: d.getUTCHours(),
-    min: d.getUTCMinutes(),
-    dow: d.getUTCDay(),
-  };
-}
-
-function istDayKey() {
-  const i = getIST();
-  return `${i.year}-${i.month + 1}-${i.day}`;
-}
-
-let sessionDayKey = '';
-
-function isMCXOpen() {
-  const { dow, hour, min } = getIST();
-  if (dow === 0) return false; // Sunday
-  const t = hour * 60 + min;
-  if (dow === 6) {
-    // Saturday: 9:00–14:00
-    return t >= 540 && t < 840;
-  }
-  // Mon–Fri: 9:00–23:59
-  return t >= 540 && t < 1435;
-}
-
-function resetSessionIfNewDay() {
-  const k = istDayKey();
-  if (sessionDayKey !== k) {
-    sessionDayKey = k;
-    sessionHL.gold   = { high: 0, low: Infinity };
-    sessionHL.silver = { high: 0, low: Infinity };
-    console.log('[SESSION] Reset for day', k);
-  }
-}
-
-function updateSessionHL(sym, ltp, high, low) {
-  resetSessionIfNewDay();
-  if (ltp && ltp > 0) {
-    if (ltp > sessionHL[sym].high) sessionHL[sym].high = ltp;
-    if (ltp < sessionHL[sym].low)  sessionHL[sym].low  = ltp;
-  }
-  if (high && high > 0 && high > sessionHL[sym].high) sessionHL[sym].high = high;
-  if (low  && low  > 0 && low  < sessionHL[sym].low)  sessionHL[sym].low  = low;
-}
-
-function tickAgeSeconds() {
-  if (!WS.lastTickAt) return Infinity;
-  return Math.floor((Date.now() - WS.lastTickAt) / 1000);
-}
-
-function isDhanLive() {
-  return WS.wsStatus === 'connected' && tickAgeSeconds() < 10 && liveTick.gold.ltp > 0;
-}
-
-function isDhanStale() {
-  const age = tickAgeSeconds();
-  return liveTick.gold.ltp > 0 && age >= 10 && age < 300;
-}
-
-// ─── FOREX + SPOT ──────────────────────────────────────────────────
-async function refreshForexAndSpot() {
-  let usdInr = 0;
-  let xauUsd = 0;
-  let xagUsd = 0;
-  let src = '';
-
-  const fxSources = [
+async function refreshForex() {
+  let usdInr = 0, src = '';
+  const fxSrc = [
     ['frankfurter', async () => {
       const r = await axios.get('https://api.frankfurter.app/latest?from=USD&to=INR', { timeout: 5000 });
-      return r.data && r.data.rates && r.data.rates.INR;
+      return r.data.rates.INR;
     }],
     ['open.er-api', async () => {
       const r = await axios.get('https://open.er-api.com/v6/latest/USD', { timeout: 5000 });
-      return r.data && r.data.rates && r.data.rates.INR;
-    }],
-    ['fawazahmed0', async () => {
-      const r = await axios.get('https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json', { timeout: 5000 });
-      return r.data && r.data.usd && r.data.usd.inr;
+      return r.data.rates.INR;
     }],
   ];
 
-  for (const [name, fn] of fxSources) {
+  for (const [name, fn] of fxSrc) {
     if (usdInr) break;
     try {
       const v = await fn();
-      if (v && v > 70 && v < 110) {
-        usdInr = v;
-        src = name;
-      }
-    } catch (e) {
-      console.warn('[FOREX]', name, 'failed:', e.message);
-    }
+      if (v > 70 && v < 110) { usdInr = v; src = name; }
+    } catch (e) { console.warn('[FOREX]', name, e.message); }
   }
 
-  if (!usdInr) {
-    usdInr = forexCache.usdInr;
-    src = forexCache.src || 'cached';
-  }
+  if (!usdInr) { usdInr = forexCache.usdInr; src = 'cached'; }
 
+  let xauUsd = 0, xagUsd = 0;
   try {
     const r = await axios.get('https://api.metals.live/v1/spot/gold,silver', { timeout: 6000 });
     if (Array.isArray(r.data)) {
-      const g = r.data.find(x => Object.prototype.hasOwnProperty.call(x, 'gold'));
-      const s = r.data.find(x => Object.prototype.hasOwnProperty.call(x, 'silver'));
-      if (g && g.gold > 3000 && g.gold < 9000) xauUsd = g.gold;
-      if (s && s.silver > 20 && s.silver < 300) xagUsd = s.silver;
+      const g = r.data.find(x => x.gold); const s = r.data.find(x => x.silver);
+      if (g && g.gold > 3000) xauUsd = g.gold;
+      if (s && s.silver > 20) xagUsd = s.silver;
     }
-  } catch (e) {
-    console.warn('[SPOT] metals.live failed:', e.message);
-  }
+  } catch (e) { console.warn('[SPOT] metals.live', e.message); }
 
-  if (!xauUsd || !xagUsd) {
+  if (!xauUsd) {
     try {
-      const [gr, sr] = await Promise.all([
+      const [g, s] = await Promise.all([
         axios.get('https://www.gold-api.com/price/XAU', { timeout: 7000 }),
         axios.get('https://www.gold-api.com/price/XAG', { timeout: 7000 }),
       ]);
-      const g = gr.data && gr.data.price;
-      const s = sr.data && sr.data.price;
-      if (g && g > 3000 && g < 9000) xauUsd = g;
-      if (s && s > 20 && s < 300) xagUsd = s;
-    } catch (e) {
-      console.warn('[SPOT] gold-api failed:', e.message);
-    }
+      if (g.data.price > 3000) xauUsd = g.data.price;
+      if (s.data.price > 20)   xagUsd = s.data.price;
+    } catch (e) { console.warn('[SPOT] gold-api', e.message); }
   }
 
-  if (!xauUsd || !xagUsd) {
-    xauUsd = forexCache.xauUsd;
-    xagUsd = forexCache.xagUsd;
-  }
-
-  forexCache.usdInr = usdInr;
-  forexCache.xauUsd = xauUsd;
-  forexCache.xagUsd = xagUsd;
+  forexCache.usdInr    = usdInr    || forexCache.usdInr;
+  forexCache.xauUsd    = xauUsd    || forexCache.xauUsd;
+  forexCache.xagUsd    = xagUsd    || forexCache.xagUsd;
   forexCache.updatedAt = new Date().toISOString();
-  forexCache.src = src;
-
-  console.log('[FOREX] usdInr=%s xauUsd=%s xagUsd=%s src=%s', usdInr, xauUsd, xagUsd, src);
+  forexCache.src       = src;
+  console.log('[FOREX] usdInr=%s xauUsd=%s xagUsd=%s src=%s',
+    forexCache.usdInr, forexCache.xauUsd, forexCache.xagUsd, src);
 }
 
-function getSpotDerived() {
-  const { usdInr, xauUsd, xagUsd, src } = forexCache;
-  const FACTOR = 1.103; // duties/charges factor
-  const goldPer10g = Math.round((xauUsd / 31.1035) * 10 * usdInr * FACTOR);
-  const silverPerKg = Math.round((xagUsd / 31.1035) * 1000 * usdInr * FACTOR);
-  return { goldPer10g, silverPerKg, usdInr, xauUsd, xagUsd, src };
+function spotDerived() {
+  const { usdInr, xauUsd, xagUsd } = forexCache;
+  const F = 1.103;
+  return {
+    goldPer10g:  Math.round((xauUsd / 31.1035) * 10   * usdInr * F),
+    silverPerKg: Math.round((xagUsd / 31.1035) * 1000 * usdInr * F),
+  };
 }
 
-// ─── DHAN TOKEN RENEW ─────────────────────────────────────────────
-async function renewDhanToken() {
-  if (!currentAccessToken || !DHAN_CLIENT_ID) return false;
-  try {
-    const r = await axios.post(`${DHAN_API_BASE}/RenewToken`, {}, {
-      headers: {
-        'access-token': currentAccessToken,
-        'dhanClientId': DHAN_CLIENT_ID,
-        'Content-Type': 'application/json',
-      },
-      timeout: 12000,
-    });
-    const t = r.data && (r.data.accessToken || r.data.access_token || (r.data.data && r.data.data.accessToken));
-    if (!t) {
-      console.warn('[TOKEN] Renew response missing accessToken');
-      return false;
-    }
-    currentAccessToken = t;
-    tokenRenewedAt = new Date().toISOString();
-    console.log('[TOKEN] Renewed at', tokenRenewedAt);
-    if (WS.ws) {
-      try { WS.ws.terminate(); } catch (e) { console.warn('[TOKEN] ws.terminate error', e.message); }
-    }
-    WS.wsStatus = 'disconnected';
-    setTimeout(connectDhan, 3000);
-    return true;
-  } catch (e) {
-    console.warn('[TOKEN] Renew failed:', e.response && e.response.data ? JSON.stringify(e.response.data) : e.message);
-    return false;
+// ─── HELPERS ──────────────────────────────────────────────────────
+function getIST() {
+  const d = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+  return { dow: d.getUTCDay(), h: d.getUTCHours(), m: d.getUTCMinutes() };
+}
+
+function isMCXOpen() {
+  const { dow, h, m } = getIST();
+  if (dow === 0) return false;
+  const t = h * 60 + m;
+  return dow === 6 ? (t >= 540 && t < 840) : (t >= 540 && t < 1435);
+}
+
+function tickAge() {
+  return WS.lastTickAt ? Math.floor((Date.now() - WS.lastTickAt) / 1000) : Infinity;
+}
+
+function isDhanLive() {
+  return WS.status === 'connected' && tickAge() < 10 && liveTick.gold.ltp > 0;
+}
+
+function updateHL(sym, ltp, high, low) {
+  if (ltp > 0) {
+    if (ltp > sessionHL[sym].high) sessionHL[sym].high = ltp;
+    if (ltp < sessionHL[sym].low)  sessionHL[sym].low  = ltp;
   }
+  if (high > 0 && high > sessionHL[sym].high) sessionHL[sym].high = high;
+  if (low  > 0 && low  < sessionHL[sym].low)  sessionHL[sym].low  = low;
 }
 
-// ─── BINARY PACKET PARSER (v2) ────────────────────────────────────
-// header = B (feedCode) H (len) B (segment) I (secId)
-function parseDhanPacket(buf) {
+// ─── BINARY PARSER — EXACT DHAN DOCS BYTE OFFSETS ─────────────────
+/*
+  Header (8 bytes):
+    byte[0]    = Feed Response Code (uint8)
+    byte[1-2]  = Message Length (int16 LE)
+    byte[3]    = Exchange Segment (uint8)
+    byte[4-7]  = Security ID (int32 LE)
+
+  TICKER (code=2): total 16 bytes
+    [8-11]  float32 LE  = LTP
+    [12-15] int32 LE    = LTT
+
+  PREV_CLOSE (code=6): total 16 bytes
+    [8-11]  float32 LE  = Prev Close Price
+    [12-15] int32 LE    = OI prev day
+
+  QUOTE (code=4): total 50 bytes
+    [8-11]  float32 LE  = LTP
+    [12-13] int16 LE    = LTQ
+    [14-17] int32 LE    = LTT
+    [18-21] float32 LE  = ATP
+    [22-25] int32 LE    = Volume
+    [26-29] int32 LE    = Total Sell Qty
+    [30-33] int32 LE    = Total Buy Qty
+    [34-37] float32 LE  = Open
+    [38-41] float32 LE  = Close (post market)
+    [42-45] float32 LE  = High
+    [46-49] float32 LE  = Low
+
+  FULL (code=8): total 162 bytes
+    [8-11]  float32 LE  = LTP
+    [12-13] int16 LE    = LTQ
+    [14-17] int32 LE    = LTT
+    [18-21] float32 LE  = ATP
+    [22-25] int32 LE    = Volume
+    [26-29] int32 LE    = Total Sell Qty
+    [30-33] int32 LE    = Total Buy Qty
+    [34-37] int32 LE    = OI
+    [38-41] int32 LE    = OI High
+    [42-45] int32 LE    = OI Low
+    [46-49] float32 LE  = Open
+    [50-53] float32 LE  = Close
+    [54-57] float32 LE  = High
+    [58-61] float32 LE  = Low
+    [62-161] Market Depth (5 x 20 bytes)
+      each depth packet:
+        [0-3]   int32 LE  = Bid Qty
+        [4-7]   int32 LE  = Ask Qty
+        [8-9]   int16 LE  = Bid Orders
+        [10-11] int16 LE  = Ask Orders
+        [12-15] float32 LE = Bid Price
+        [16-19] float32 LE = Ask Price
+*/
+function parseBuf(buf) {
   try {
-    if (!buf || buf.length < 16) return null;
+    if (!buf || buf.length < 8) return null;
+    const fc    = buf.readUInt8(0);
+    const secId = buf.readInt32LE(4).toString();
 
-    const feedCode = buf.readUInt8(0);
-    const exchSeg  = buf.readUInt8(3);
-    const secId    = buf.readInt32LE(4).toString();
-
-    if (feedCode === FEED_CODE.DISCONNECT) {
-      const code = buf.length >= 12 ? buf.readInt16LE(8) : null;
+    if (fc === FC.DISCONNECT) {
+      const code = buf.length >= 10 ? buf.readInt16LE(8) : 0;
       WS.lastDisconnectCode = code;
-      console.warn('[WS] Disconnect packet from server, code=', code);
+      console.warn('[WS] Server disconnect packet code=', code);
       return null;
     }
 
-    // Ticker: <BHBIfI (16 bytes)
-    if (feedCode === FEED_CODE.TICKER && buf.length >= 16) {
-      const ltp  = buf.readFloatLE(8);
-      const ltt  = buf.readUInt32LE(12);
-      if (!Number.isFinite(ltp) || ltp <= 0) return null;
-      return {
-        type: 'ticker',
-        exchSeg,
-        secId,
-        ltp: Math.round(ltp),
-        bid: Math.round(ltp),
-        ask: Math.round(ltp),
-        high: 0,
-        low: 0,
-        open: 0,
-        ltt,
-      };
+    if (fc === FC.PREV_CLOSE && buf.length >= 16) {
+      const prevClose = buf.readFloatLE(8);
+      return { type: 'prevClose', secId, prevClose: Math.round(prevClose) };
     }
 
-    // Full: <BHBIfHIfIIIIIIffff100s (>= 80 bytes)
-    if (feedCode === FEED_CODE.FULL && buf.length >= 80) {
+    if (fc === FC.TICKER && buf.length >= 16) {
+      const ltp = buf.readFloatLE(8);
+      const ltt = buf.readUInt32LE(12);
+      if (!Number.isFinite(ltp) || ltp <= 0) return null;
+      return { type: 'ticker', secId, ltp: Math.round(ltp), ltt };
+    }
+
+    if (fc === FC.QUOTE && buf.length >= 50) {
       const ltp  = buf.readFloatLE(8);
       const ltt  = buf.readUInt32LE(14);
       const atp  = buf.readFloatLE(18);
       const vol  = buf.readUInt32LE(22);
-      const dayOpen  = buf.readFloatLE(46);
-      const dayClose = buf.readFloatLE(50);
-      const dayHigh  = buf.readFloatLE(54);
-      const dayLow   = buf.readFloatLE(58);
-      const bidPrice = buf.readFloatLE(62 + 12);
-      const askPrice = buf.readFloatLE(62 + 16);
-
+      const open = buf.readFloatLE(34);
+      const high = buf.readFloatLE(42);
+      const low  = buf.readFloatLE(46);
       if (!Number.isFinite(ltp) || ltp <= 0) return null;
-
       return {
-        type: 'full',
-        exchSeg,
-        secId,
-        ltp: Math.round(ltp),
-        bid: Number.isFinite(bidPrice) && bidPrice > 0 ? Math.round(bidPrice) : Math.round(ltp),
-        ask: Number.isFinite(askPrice) && askPrice > 0 ? Math.round(askPrice) : Math.round(ltp),
-        high: Number.isFinite(dayHigh) && dayHigh > 0 ? Math.round(dayHigh) : 0,
-        low:  Number.isFinite(dayLow)  && dayLow  > 0 ? Math.round(dayLow)  : 0,
-        open: Number.isFinite(dayOpen) && dayOpen > 0 ? Math.round(dayOpen) : 0,
-        dayClose: Number.isFinite(dayClose) ? Math.round(dayClose) : 0,
-        atp,
-        vol,
-        ltt,
+        type: 'quote', secId,
+        ltp: Math.round(ltp), bid: Math.round(ltp), ask: Math.round(ltp),
+        open: Math.round(open), high: Math.round(high), low: Math.round(low),
+        atp, vol, ltt,
       };
     }
 
-    // Quote: <BHBIfHIfIIIffff (>= 50 bytes)
-    if (feedCode === FEED_CODE.QUOTE && buf.length >= 50) {
+    if (fc === FC.FULL && buf.length >= 162) {
       const ltp  = buf.readFloatLE(8);
       const ltt  = buf.readUInt32LE(14);
-      const atp  = buf.readFloatLE(18);
-      const vol  = buf.readUInt32LE(22);
-      const dayOpen  = buf.readFloatLE(35);
-      const dayClose = buf.readFloatLE(39);
-      const dayHigh  = buf.readFloatLE(43);
-      const dayLow   = buf.readFloatLE(47);
+      const open = buf.readFloatLE(46);
+      const high = buf.readFloatLE(54);
+      const low  = buf.readFloatLE(58);
+
+      // Market depth — 5 levels starting at byte 62
+      let bestBid = 0, bestAsk = 0;
+      for (let i = 0; i < 5; i++) {
+        const base = 62 + i * 20;
+        const bidP = buf.readFloatLE(base + 12);
+        const askP = buf.readFloatLE(base + 16);
+        if (i === 0) { bestBid = bidP; bestAsk = askP; }
+      }
 
       if (!Number.isFinite(ltp) || ltp <= 0) return null;
-
       return {
-        type: 'quote',
-        exchSeg,
-        secId,
-        ltp: Math.round(ltp),
-        bid: Math.round(ltp),
-        ask: Math.round(ltp),
-        high: Number.isFinite(dayHigh) && dayHigh > 0 ? Math.round(dayHigh) : 0,
-        low:  Number.isFinite(dayLow)  && dayLow  > 0 ? Math.round(dayLow)  : 0,
-        open: Number.isFinite(dayOpen) && dayOpen > 0 ? Math.round(dayOpen) : 0,
-        dayClose: Number.isFinite(dayClose) ? Math.round(dayClose) : 0,
-        atp,
-        vol,
+        type: 'full', secId,
+        ltp:  Math.round(ltp),
+        bid:  bestBid > 0 ? Math.round(bestBid) : Math.round(ltp),
+        ask:  bestAsk > 0 ? Math.round(bestAsk) : Math.round(ltp),
+        open: Math.round(open), high: Math.round(high), low: Math.round(low),
         ltt,
       };
     }
 
     return null;
   } catch (e) {
-    console.warn('[PARSE] Failed:', e.message);
+    console.warn('[PARSE] err', e.message);
     return null;
   }
 }
 
-// ─── WEBSOCKET ─────────────────────────────────────────────────────
-function getDhanWsUrl() {
+// ─── WEBSOCKET ────────────────────────────────────────────────────
+function buildWsUrl() {
   return 'wss://api-feed.dhan.co?version=2'
-    + '&token='    + encodeURIComponent(currentAccessToken)
+    + '&token='    + encodeURIComponent(DHAN_ACCESS_TOKEN)
     + '&clientId=' + encodeURIComponent(DHAN_CLIENT_ID)
     + '&authType=2';
 }
 
-function connectDhan() {
-  if (!DHAN_CLIENT_ID || !currentAccessToken) {
-    console.warn('[WS] Missing DHAN_CLIENT_ID or access token');
-    return;
-  }
-  if (WS.wsStatus === 'connecting' || WS.wsStatus === 'connected') return;
+function subscribe(ws) {
+  const instruments = Object.keys(TOKENS).map(secId => ({
+    ExchangeSegment: 'MCX_COMM',
+    SecurityId: secId,
+  }));
 
-  WS.wsStatus = 'connecting';
+  [15, 17, 21].forEach((code, idx) => {
+    setTimeout(() => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({
+        RequestCode: code,
+        InstrumentCount: instruments.length,
+        InstrumentList: instruments,
+      }));
+      console.log('[WS] Sent RequestCode', code);
+    }, idx * 400);
+  });
+}
+
+function connectDhan() {
+  if (!DHAN_CLIENT_ID || !DHAN_ACCESS_TOKEN) {
+    console.warn('[WS] Missing credentials'); return;
+  }
+  if (WS.status === 'connecting' || WS.status === 'connected') return;
+
+  WS.status = 'connecting';
   WS.lastConnectAt = new Date().toISOString();
   WS.lastDisconnectCode = null;
-  console.log('[WS] Connecting to Dhan feed...');
+  WS.packetsReceived = 0;
+  console.log('[WS] Connecting...');
 
-  const ws = new WebSocket(getDhanWsUrl(), { handshakeTimeout: 15000 });
+  const ws = new WebSocket(buildWsUrl(), { handshakeTimeout: 15000 });
   WS.ws = ws;
 
   ws.on('open', () => {
-    WS.wsStatus = 'connected';
+    WS.status = 'connected';
     WS.reconnectCount = 0;
-    console.log('[WS] Connected, subscribing instruments');
-
-    const instruments = [
-      { ExchangeSegment: EXCH_SEG.MCX_COMM, SecurityId: TOKENS.goldCurrent.secId },
-      { ExchangeSegment: EXCH_SEG.MCX_COMM, SecurityId: TOKENS.goldNext.secId },
-      { ExchangeSegment: EXCH_SEG.MCX_COMM, SecurityId: TOKENS.silverCurrent.secId },
-      { ExchangeSegment: EXCH_SEG.MCX_COMM, SecurityId: TOKENS.silverNext.secId },
-    ];
-
-    const payload15 = { RequestCode: 15, InstrumentCount: instruments.length, InstrumentList: instruments };
-    ws.send(JSON.stringify(payload15));
-    console.log('[WS] Sent RequestCode 15 (Ticker)');
-
-    setTimeout(() => {
-      if (ws.readyState !== WebSocket.OPEN) return;
-      const payload17 = { RequestCode: 17, InstrumentCount: instruments.length, InstrumentList: instruments };
-      ws.send(JSON.stringify(payload17));
-      console.log('[WS] Sent RequestCode 17 (Quote)');
-    }, 300);
-
-    setTimeout(() => {
-      if (ws.readyState !== WebSocket.OPEN) return;
-      const payload21 = { RequestCode: 21, InstrumentCount: instruments.length, InstrumentList: instruments };
-      ws.send(JSON.stringify(payload21));
-      console.log('[WS] Sent RequestCode 21 (Full)');
-    }, 600);
+    console.log('[WS] Connected — subscribing');
+    subscribe(ws);
   });
 
   ws.on('message', (data) => {
     if (typeof data === 'string') {
-      WS.lastTextMsg = data.toString().slice(0, 500);
-      console.log('[WS] Text message:', WS.lastTextMsg);
+      WS.lastTextMsg = data.slice(0, 500);
+      console.log('[WS] Text:', WS.lastTextMsg);
       return;
     }
 
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    WS.packetsReceived++;
 
-    if (!WS.lastRawBufHex) {
-      WS.lastRawBufHex = buf.slice(0, Math.min(buf.length, 32)).toString('hex');
-      console.log('[WS] First binary packet hex=%s len=%d feedCode=%d', WS.lastRawBufHex, buf.length, buf.readUInt8(0));
+    // Log first 5 raw packets for debug
+    if (WS.packetsReceived <= 5) {
+      const hex = buf.slice(0, Math.min(buf.length, 32)).toString('hex');
+      WS.lastRawBufHex = hex;
+      console.log('[WS] Packet #%d feedCode=%d len=%d hex=%s',
+        WS.packetsReceived, buf.readUInt8(0), buf.length, hex);
     }
 
-    const tick = parseDhanPacket(buf);
-    if (!tick || !tick.ltp) return;
+    const tick = parseBuf(buf);
+    if (!tick) return;
 
+    const token = TOKENS[tick.secId];
+    if (!token) {
+      console.log('[WS] Unknown secId=%s ltp=%d', tick.secId, tick.ltp);
+      return;
+    }
+
+    const key = token.key;
     WS.lastTickAt = Date.now();
 
-    const { secId } = tick;
+    if (tick.type === 'prevClose') {
+      liveTick[key].prevClose = tick.prevClose;
+      console.log('[WS] PrevClose %s = %d', key, tick.prevClose);
+      return;
+    }
 
-    if (secId === TOKENS.goldCurrent.secId) {
-      liveTick.gold = { ...liveTick.gold, ...tick, ts: WS.lastTickAt };
-      updateSessionHL('gold', tick.ltp, tick.high, tick.low);
-    } else if (secId === TOKENS.goldNext.secId) {
-      liveTick.goldNext = { ...liveTick.goldNext, ...tick, ts: WS.lastTickAt };
-    } else if (secId === TOKENS.silverCurrent.secId) {
-      liveTick.silver = { ...liveTick.silver, ...tick, ts: WS.lastTickAt };
-      updateSessionHL('silver', tick.ltp, tick.high, tick.low);
-    } else if (secId === TOKENS.silverNext.secId) {
-      liveTick.silverNext = { ...liveTick.silverNext, ...tick, ts: WS.lastTickAt };
-    } else {
-      console.log('[WS] Tick for unknown secId=%s ltp=%d', secId, tick.ltp);
+    // Merge tick into live state
+    liveTick[key] = {
+      ...liveTick[key],
+      ltp:  tick.ltp  || liveTick[key].ltp,
+      bid:  tick.bid  || liveTick[key].bid,
+      ask:  tick.ask  || liveTick[key].ask,
+      open: tick.open || liveTick[key].open,
+      high: tick.high || liveTick[key].high,
+      low:  tick.low  || liveTick[key].low,
+      ts:   WS.lastTickAt,
+    };
+
+    if (key === 'gold' || key === 'silver') {
+      updateHL(key, tick.ltp, tick.high, tick.low);
     }
   });
 
   ws.on('close', (code, reason) => {
-    WS.wsStatus = 'disconnected';
+    WS.status = 'disconnected';
     WS.lastDisconnectAt = new Date().toISOString();
-    console.warn('[WS] Closed code=%s reason=%s', code, reason && reason.toString ? reason.toString() : '');
-
-    if (code === 807 || code === 808 || code === 809) {
-      renewDhanToken().then(() => scheduleReconnect());
-    } else {
-      scheduleReconnect();
-    }
+    console.warn('[WS] Closed code=%s reason=%s', code,
+      reason && reason.toString ? reason.toString() : '');
+    scheduleReconnect();
   });
 
   ws.on('error', (err) => {
@@ -469,152 +396,98 @@ function connectDhan() {
 
 function scheduleReconnect() {
   if (WS.reconnectTimer) return;
-  WS.reconnectCount += 1;
+  WS.reconnectCount++;
   const delay = Math.min(2000 * Math.pow(2, Math.min(WS.reconnectCount, 5)), 60000);
-  console.log('[WS] Reconnect scheduled in', delay / 1000, 'seconds');
+  console.log('[WS] Reconnect in', delay / 1000, 's');
   WS.reconnectTimer = setTimeout(() => {
     WS.reconnectTimer = null;
     connectDhan();
   }, delay);
 }
 
-// ─── ROUTES ────────────────────────────────────────────────────────
+// ─── ROUTES ───────────────────────────────────────────────────────
 app.get('/rates', async (req, res) => {
   const marketOpen = isMCXOpen();
-  const nowIso = new Date().toISOString();
-  const { usdInr, xauUsd, xagUsd } = forexCache;
+  const now        = new Date().toISOString();
 
   if (isDhanLive()) {
     const g  = liveTick.gold;
     const s  = liveTick.silver;
     const gN = liveTick.goldNext;
     const sN = liveTick.silverNext;
-
-    const gHigh = sessionHL.gold.high || g.high;
-    const gLow  = sessionHL.gold.low === Infinity ? (g.low || g.ltp) : sessionHL.gold.low;
-    const sHigh = sessionHL.silver.high || s.high;
-    const sLow  = sessionHL.silver.low === Infinity ? (s.low || s.ltp) : sessionHL.silver.low;
-
     const payload = {
-      success: true,
-      source: 'dhan_mcx_live',
-      marketOpen,
+      success: true, source: 'dhan_mcx_live', marketOpen,
       tickAgeMs: Date.now() - WS.lastTickAt,
-      tickAgeSeconds: tickAgeSeconds(),
-      goldPer10g: g.ltp,
-      silverPerKg: s.ltp,
+      goldPer10g: g.ltp, silverPerKg: s.ltp,
       futures: {
-        gold:       { ltp: g.ltp, bid: g.bid, ask: g.ask, high: gHigh, low: gLow, open: g.open },
-        silver:     { ltp: s.ltp, bid: s.bid, ask: s.ask, high: sHigh, low: sLow, open: s.open },
+        gold:       { ltp: g.ltp,  bid: g.bid,  ask: g.ask,  high: sessionHL.gold.high || g.high,   low: sessionHL.gold.low === Infinity ? g.low : sessionHL.gold.low, open: g.open, prevClose: g.prevClose },
+        silver:     { ltp: s.ltp,  bid: s.bid,  ask: s.ask,  high: sessionHL.silver.high || s.high, low: sessionHL.silver.low === Infinity ? s.low : sessionHL.silver.low, open: s.open, prevClose: s.prevClose },
         goldNext:   { ltp: gN.ltp || g.ltp, bid: gN.bid || g.bid, ask: gN.ask || g.ask },
         silverNext: { ltp: sN.ltp || s.ltp, bid: sN.bid || s.bid, ask: sN.ask || s.ask },
       },
-      usdInr,
-      xauUsd,
-      xagUsd,
-      forexUpdatedAt: forexCache.updatedAt,
-      timestamp: nowIso,
+      usdInr: forexCache.usdInr, xauUsd: forexCache.xauUsd,
+      forexUpdatedAt: forexCache.updatedAt, timestamp: now,
     };
-
     lastKnownRates = { ...payload };
     return res.json(payload);
   }
 
-  if (isDhanStale() || lastKnownRates) {
+  if (lastKnownRates) {
     return res.json({
-      ...(lastKnownRates || {}),
-      success: true,
+      ...lastKnownRates,
       source: 'last_known_rates',
-      marketOpen,
-      tickAgeSeconds: tickAgeSeconds() === Infinity ? null : tickAgeSeconds(),
-      priceAsOf: WS.lastTickAt ? new Date(WS.lastTickAt).toISOString() : null,
-      usdInr,
-      xauUsd,
-      xagUsd,
-      forexUpdatedAt: forexCache.updatedAt,
-      timestamp: nowIso,
+      tickAgeSeconds: tickAge() === Infinity ? null : tickAge(),
+      timestamp: now,
     });
   }
 
-  const spot = getSpotDerived();
+  const { goldPer10g, silverPerKg } = spotDerived();
   return res.json({
-    success: true,
-    source: 'spot_derived',
-    marketOpen,
-    note: 'Live MCX feed unavailable, using spot-derived estimate',
-    spotSource: spot.src,
-    usdInr: spot.usdInr,
-    xauUsd: spot.xauUsd,
-    xagUsd: spot.xagUsd,
-    forexUpdatedAt: forexCache.updatedAt,
-    goldPer10g: spot.goldPer10g,
-    silverPerKg: spot.silverPerKg,
-    futures: {
-      gold:       { ltp: spot.goldPer10g, bid: spot.goldPer10g, ask: spot.goldPer10g },
-      silver:     { ltp: spot.silverPerKg, bid: spot.silverPerKg, ask: spot.silverPerKg },
-      goldNext:   { ltp: null, bid: null, ask: null },
-      silverNext: { ltp: null, bid: null, ask: null },
-    },
-    timestamp: nowIso,
+    success: true, source: 'spot_derived', marketOpen,
+    note: 'MCX feed unavailable — spot derived',
+    goldPer10g, silverPerKg,
+    usdInr: forexCache.usdInr, xauUsd: forexCache.xauUsd,
+    forexUpdatedAt: forexCache.updatedAt, timestamp: now,
   });
 });
 
 app.get('/debug', (req, res) => {
   res.json({
-    server: 'RR Jewellers full v2',
-    wsStatus: WS.wsStatus,
+    server: 'RR Jewellers WS v3 (docs-exact)',
+    wsStatus: WS.status,
     lastTickAt: WS.lastTickAt ? new Date(WS.lastTickAt).toISOString() : null,
-    tickAgeSeconds: tickAgeSeconds() === Infinity ? null : tickAgeSeconds(),
+    tickAgeSeconds: tickAge() === Infinity ? null : tickAge(),
+    packetsReceived: WS.packetsReceived,
+    lastRawBufHex: WS.lastRawBufHex,
+    lastTextMsg: WS.lastTextMsg,
+    lastDisconnectCode: WS.lastDisconnectCode,
     reconnectCount: WS.reconnectCount,
     lastConnectAt: WS.lastConnectAt,
     lastDisconnectAt: WS.lastDisconnectAt,
-    lastDisconnectCode: WS.lastDisconnectCode,
-    currentSource: isDhanLive()
-      ? 'dhan_mcx_live'
-      : (isDhanStale() || lastKnownRates ? 'last_known_rates' : 'spot_derived'),
     marketOpen: isMCXOpen(),
-    tokenRenewedAt,
-    sessionHL,
-    liveTick,
-    tokens: TOKENS,
-    forexCache,
-    lastRawBufHex: WS.lastRawBufHex,
-    lastTextMsg: WS.lastTextMsg,
-    lastKnownRatesAt: lastKnownRates && lastKnownRates.timestamp ? lastKnownRates.timestamp : null,
-    credentials: { clientId: !!DHAN_CLIENT_ID, accessToken: !!currentAccessToken },
-    env: { SHEET_ID: !!SHEET_ID, SELF_URL: SELF_URL || null },
+    liveTick, sessionHL, forexCache,
+    credentials: { clientId: !!DHAN_CLIENT_ID, accessToken: !!DHAN_ACCESS_TOKEN },
+    env: { SELF_URL: SELF_URL || null },
   });
 });
 
-app.get('/ping', (req, res) => {
-  res.json({ ok: true, ts: Date.now() });
-});
+app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
+app.get('/', (req, res) => res.json({
+  status: 'RR Jewellers WS v3',
+  endpoints: ['/rates', '/debug', '/ping'],
+}));
 
-app.get('/', (req, res) => {
-  res.json({
-    status: 'RR Jewellers full v2',
-    wsStatus: WS.wsStatus,
-    endpoints: ['/rates', '/debug', '/ping'],
-  });
-});
-
-// ─── STARTUP ───────────────────────────────────────────────────────
+// ─── STARTUP ──────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', async () => {
-  console.log('[STARTUP] RR Jewellers full v2 on port', PORT);
-  try {
-    await refreshForexAndSpot();
-  } catch (e) {
-    console.warn('[STARTUP] refreshForexAndSpot failed:', e.message);
-  }
+  console.log('[STARTUP] RR Jewellers WS v3 on port', PORT);
+  try { await refreshForex(); } catch (e) { console.warn('[STARTUP] forex err:', e.message); }
   connectDhan();
-
-  setInterval(refreshForexAndSpot, 5 * 60 * 1000);
-  setInterval(resetSessionIfNewDay, 60 * 1000);
+  setInterval(refreshForex, 5 * 60 * 1000);
   setInterval(() => {
     const url = SELF_URL || `http://localhost:${PORT}`;
     axios.get(url + '/ping').catch(() => {});
   }, 4 * 60 * 1000);
   setInterval(() => {
-    if (WS.wsStatus === 'disconnected' && !WS.reconnectTimer) connectDhan();
-  }, 2 * 60 * 1000);
+    if (WS.status === 'disconnected' && !WS.reconnectTimer) connectDhan();
+  }, 60 * 1000);
 });
