@@ -1,13 +1,13 @@
 'use strict';
-// RR Jewellers v10 — Production Final
+// RR Jewellers v10.1 — Added TD /quote for real XAU/XAG/USDINR day OHLC
 // MCX: Dhan WebSocket (live ticks ~95ms)
 // SPOT: Twelve Data WebSocket (XAU/USD, XAG/USD ~170ms)
 // USD/INR: Free REST APIs cached 5min
 // Margin: GOLD_MARGIN_PCT + SILVER_MARGIN_PCT env vars
 
-const express   = require('express');
-const cors      = require('cors');
-const axios     = require('axios');
+const express = require('express');
+const cors    = require('cors');
+const axios   = require('axios');
 const WebSocket = require('ws');
 
 const app = express();
@@ -15,18 +15,15 @@ app.use(cors());
 app.use(express.json());
 
 // ─── ENV VARS ──────────────────────────────────────────
-const PORT               = process.env.PORT               || 3000;
-const SELF_URL           = process.env.SELF_URL           || '';
-const SHEET_ID           = process.env.SHEET_ID           || '';
-const DHAN_CLIENT_ID     = process.env.DHAN_CLIENT_ID     || '';
-const DHAN_ACCESS_TOKEN  = process.env.DHAN_ACCESS_TOKEN  || '';
-const TWELVE_DATA_KEY    = process.env.TWELVE_DATA_KEY    || ''; // twelvedata.com free key
-// Shop margin % added to MCX rate before sending to HTML
-// Set in Render Dashboard → Environment
-// Example: GOLD_MARGIN_PCT=1.00 means Gold sell rate = MCX × 1.01
-const GOLD_MARGIN_PCT    = parseFloat(process.env.GOLD_MARGIN_PCT   || '0');
-const SILVER_MARGIN_PCT  = parseFloat(process.env.SILVER_MARGIN_PCT || '0');
-const DHAN_BASE          = 'https://api.dhan.co/v2';
+const PORT              = process.env.PORT || 3000;
+const SELF_URL          = process.env.SELF_URL || '';
+const SHEET_ID          = process.env.SHEET_ID || '';
+const DHAN_CLIENT_ID    = process.env.DHAN_CLIENT_ID || '';
+const DHAN_ACCESS_TOKEN = process.env.DHAN_ACCESS_TOKEN || '';
+const TWELVE_DATA_KEY   = process.env.TWELVE_DATA_KEY || '';
+const GOLD_MARGIN_PCT   = parseFloat(process.env.GOLD_MARGIN_PCT   || '0');
+const SILVER_MARGIN_PCT = parseFloat(process.env.SILVER_MARGIN_PCT || '0');
+const DHAN_BASE         = 'https://api.dhan.co/v2';
 
 // ─── MCX CONTRACTS ─────────────────────────────────────
 const GOLD_CONTRACTS = [
@@ -44,7 +41,7 @@ const SILVER_CONTRACTS = [
 ];
 
 function pickCurrentAndNext(contracts) {
-  var now = new Date();
+  var now    = new Date();
   var sorted = contracts
     .map(function(c){ return Object.assign({},c,{ed:new Date(c.expiry)}); })
     .filter(function(c){ return !isNaN(c.ed); })
@@ -71,9 +68,9 @@ function applyTick(key,tick){
   var l=tick.ltp;
   if(key==='gold'){
     RC.goldLtp=l;
-    if(tick.high>0) RC.goldHigh=tick.high;
-    if(tick.low>0)  RC.goldLow=tick.low;
-    if(tick.open>0) RC.goldOpen=tick.open;
+    if(tick.high>0)      RC.goldHigh=tick.high;
+    if(tick.low>0)       RC.goldLow=tick.low;
+    if(tick.open>0)      RC.goldOpen=tick.open;
     if(tick.prevClose>0) RC.goldPrevClose=tick.prevClose;
     RC.goldBid=tick.bid>0?tick.bid:l-30;
     RC.goldAsk=tick.ask>0?tick.ask:l+30;
@@ -85,9 +82,9 @@ function applyTick(key,tick){
     if(tick.low>0)  RC.goldNextLow=tick.low;
   } else if(key==='silver'){
     RC.silverLtp=l;
-    if(tick.high>0) RC.silverHigh=tick.high;
-    if(tick.low>0)  RC.silverLow=tick.low;
-    if(tick.open>0) RC.silverOpen=tick.open;
+    if(tick.high>0)      RC.silverHigh=tick.high;
+    if(tick.low>0)       RC.silverLow=tick.low;
+    if(tick.open>0)      RC.silverOpen=tick.open;
     if(tick.prevClose>0) RC.silverPrevClose=tick.prevClose;
     RC.silverBid=tick.bid>0?tick.bid:l-100;
     RC.silverAsk=tick.ask>0?tick.ask:l+100;
@@ -102,13 +99,11 @@ function applyTick(key,tick){
 }
 
 // ─── FOREX CACHE ───────────────────────────────────────
-// XAU/USD + XAG/USD: Twelve Data WebSocket (live ~170ms)
-// USD/INR: Free REST APIs cached 5min
 var FX = {
   usdInr:94.5, xauUsd:0, xagUsd:0,
   xauBid:0, xauAsk:0, xauHigh:0, xauLow:0,
   xagBid:0, xagAsk:0, xagHigh:0, xagLow:0,
-  usdInrHigh:0, usdInrLow:Infinity,  // session high/low
+  usdInrHigh:0, usdInrLow:Infinity,
   updatedAt:null, src:'init',
   xauUpdatedAt:null, xagUpdatedAt:null,
 };
@@ -134,50 +129,64 @@ async function refreshUsdInr(){
   }
   if(!v){v=FX.usdInr;src='cached';}
   FX.usdInr=Math.round(v*100)/100;
-  // Track session High/Low for USD/INR
-  if (FX.usdInr > 0) {
-    if (!FX.usdInrHigh || FX.usdInr > FX.usdInrHigh) FX.usdInrHigh = FX.usdInr;
-    if (FX.usdInrLow === Infinity || FX.usdInr < FX.usdInrLow) FX.usdInrLow = FX.usdInr;
+  if(FX.usdInr>0){
+    if(!FX.usdInrHigh||FX.usdInr>FX.usdInrHigh) FX.usdInrHigh=FX.usdInr;
+    if(FX.usdInrLow===Infinity||FX.usdInr<FX.usdInrLow) FX.usdInrLow=FX.usdInr;
   }
   FX.updatedAt=new Date().toISOString();
   FX.src=src;
   console.log('[FOREX] usdInr=%s H=%s L=%s src=%s',FX.usdInr,FX.usdInrHigh,FX.usdInrLow,FX.src);
 }
 
-// ─── TWELVE DATA WEBSOCKET (XAU/USD + XAG/USD) ─────────
-var TDws = {
-  ws:null, status:'disconnected',
-  reconnectTimer:null, reconnectCount:0,
-  lastConnectAt:null, packetsReceived:0,
-};
+// ─── TWELVE DATA QUOTE REST (Real Day OHLC) ─────────────
+async function refreshSpotOHLC(){
+  if(!TWELVE_DATA_KEY) return;
+  try{
+    var r=await axios.get('https://api.twelvedata.com/quote',{
+      params:{symbol:'XAU/USD,XAG/USD,USD/INR',apikey:TWELVE_DATA_KEY},
+      timeout:8000,
+    });
+    var d=r.data;
+    var xau=d['XAU/USD'], xag=d['XAG/USD'], inr=d['USD/INR'];
+    if(xau&&parseFloat(xau.high)>3000){
+      FX.xauHigh=parseFloat(xau.high);
+      FX.xauLow=parseFloat(xau.low);
+    }
+    if(xag&&parseFloat(xag.high)>20){
+      if(parseFloat(xag.close)>20){ FX.xagUsd=parseFloat(xag.close); FX.xagBid=parseFloat(xag.close); FX.xagAsk=parseFloat(xag.close); }
+      FX.xagHigh=parseFloat(xag.high);
+      FX.xagLow=parseFloat(xag.low);
+      FX.xagUpdatedAt=new Date().toISOString();
+    }
+    if(inr&&parseFloat(inr.high)>70){
+      FX.usdInrHigh=parseFloat(inr.high);
+      FX.usdInrLow=parseFloat(inr.low);
+    }
+    console.log('[TD-OHLC] xauH=%s xauL=%s xagUsd=%s xagH=%s xagL=%s inrH=%s inrL=%s',
+      FX.xauHigh,FX.xauLow,FX.xagUsd,FX.xagHigh,FX.xagLow,FX.usdInrHigh,FX.usdInrLow);
+  }catch(e){ console.warn('[TD-OHLC] failed:',e.message); }
+}
+
+// ─── TWELVE DATA WEBSOCKET (XAU/USD + XAG/USD live ticks) ──
+var TDws={ws:null,status:'disconnected',reconnectTimer:null,reconnectCount:0,lastConnectAt:null,packetsReceived:0};
 
 function connectTwelveData(){
-  if(!TWELVE_DATA_KEY){
-    console.warn('[TD] No TWELVE_DATA_KEY — using REST fallback for spot');
-    refreshSpotREST();
-    return;
-  }
+  if(!TWELVE_DATA_KEY){ console.warn('[TD] No TWELVE_DATA_KEY — using REST fallback'); refreshSpotREST(); return; }
   if(TDws.status==='connecting'||TDws.status==='connected') return;
   TDws.status='connecting';
   TDws.lastConnectAt=new Date().toISOString();
-  console.log('[TD] Connecting to Twelve Data WebSocket...');
-
+  console.log('[TD] Connecting...');
   var ws=new WebSocket('wss://ws.twelvedata.com/v1/quotes/price?apikey='+TWELVE_DATA_KEY,{handshakeTimeout:15000});
   TDws.ws=ws;
-
   ws.on('open',function(){
     TDws.status='connected'; TDws.reconnectCount=0;
     console.log('[TD] Connected');
-    ws.send(JSON.stringify({
-      action: 'subscribe',
-      params: { symbols: 'XAU/USD,XAG/USD' }
-    }));
+    ws.send(JSON.stringify({action:'subscribe',params:{symbols:'XAU/USD,XAG/USD'}}));
   });
-
   ws.on('message',function(data){
     try{
       var msg=JSON.parse(data);
-      if(msg.event==='subscribe-status') { console.log('[TD]',msg.status,msg.message||''); return; }
+      if(msg.event==='subscribe-status'){ console.log('[TD]',msg.status,msg.message||''); return; }
       if(msg.event==='heartbeat') return;
       if(msg.event==='price'&&msg.symbol&&msg.price){
         TDws.packetsReceived++;
@@ -203,7 +212,6 @@ function connectTwelveData(){
       }
     }catch(e){}
   });
-
   ws.on('close',function(code){
     TDws.status='disconnected';
     console.warn('[TD] Closed code=%s',code);
@@ -211,18 +219,18 @@ function connectTwelveData(){
     var d=Math.min(3000*Math.pow(2,Math.min(TDws.reconnectCount,4)),30000);
     TDws.reconnectTimer=setTimeout(function(){TDws.reconnectTimer=null;connectTwelveData();},d);
   });
-
   ws.on('error',function(e){ console.warn('[TD] Error:',e.message); });
 }
 
-// REST fallback when no Twelve Data key
+// ─── REST FALLBACK (no Twelve Data key) ────────────────
 async function refreshSpotREST(){
   try{
     var r=await axios.get('https://api.metals.live/v1/spot/gold,silver',{timeout:6000});
     if(Array.isArray(r.data)){
-      var g=r.data.find(function(x){return x.gold;}),s=r.data.find(function(x){return x.silver;});
-      if(g&&g.gold>3000){FX.xauUsd=Math.round(g.gold*100)/100;}
-      if(s&&s.silver>20){FX.xagUsd=Math.round(s.silver*1000)/1000;}
+      var g=r.data.find(function(x){return Object.prototype.hasOwnProperty.call(x,'gold');});
+      var s=r.data.find(function(x){return Object.prototype.hasOwnProperty.call(x,'silver');});
+      if(g&&g.gold>3000)  FX.xauUsd=Math.round(g.gold*100)/100;
+      if(s&&s.silver>20)  FX.xagUsd=Math.round(s.silver*1000)/1000;
       FX.xauUpdatedAt=new Date().toISOString();
       FX.xagUpdatedAt=new Date().toISOString();
       return;
@@ -268,7 +276,7 @@ async function renewToken(){
       return true;
     }
     return false;
-  }catch(e){console.warn('[TOKEN] Renew failed:',e.message.slice(0,60));return false;}
+  }catch(e){ console.warn('[TOKEN] Renew failed:',e.message.slice(0,60)); return false; }
 }
 
 // ─── DHAN WEBSOCKET ────────────────────────────────────
@@ -309,9 +317,9 @@ function parseBuf(buf){
   try{
     if(!buf||buf.length<8) return null;
     var fc=buf.readUInt8(0), secId=buf.readInt32LE(4).toString();
-    if(fc===50){WS.lastDisconnectCode=buf.length>=10?buf.readInt16LE(8):0;return null;}
-    if(fc===6&&buf.length>=16){var pc=buf.readFloatLE(8);return isFinite(pc)&&pc>0?{type:'prevClose',secId,prevClose:Math.round(pc)}:null;}
-    if(fc===2&&buf.length>=16){var l2=buf.readFloatLE(8);return !isFinite(l2)||l2<=100?null:{type:'ticker',secId,ltp:Math.round(l2)};}
+    if(fc===50){ WS.lastDisconnectCode=buf.length>=10?buf.readInt16LE(8):0; return null; }
+    if(fc===6&&buf.length>=16){ var pc=buf.readFloatLE(8); return isFinite(pc)&&pc>0?{type:'prevClose',secId,prevClose:Math.round(pc)}:null; }
+    if(fc===2&&buf.length>=16){ var l2=buf.readFloatLE(8); return !isFinite(l2)||l2<=100?null:{type:'ticker',secId,ltp:Math.round(l2)}; }
     if(fc===4&&buf.length>=50){
       var l4=buf.readFloatLE(8); if(!isFinite(l4)||l4<=100) return null;
       return{type:'quote',secId,ltp:Math.round(l4),open:Math.round(buf.readFloatLE(34))||0,high:Math.round(buf.readFloatLE(42))||0,low:Math.round(buf.readFloatLE(46))||0};
@@ -322,11 +330,11 @@ function parseBuf(buf){
       var h8=buf.length>57?Math.round(buf.readFloatLE(54)):0;
       var lw8=buf.length>61?Math.round(buf.readFloatLE(58)):0;
       var b8=Math.round(l8),a8=Math.round(l8);
-      if(buf.length>=82){var bf=buf.readFloatLE(74),af=buf.readFloatLE(78);if(isFinite(bf)&&bf>100)b8=Math.round(bf);if(isFinite(af)&&af>100)a8=Math.round(af);}
+      if(buf.length>=82){ var bf=buf.readFloatLE(74),af=buf.readFloatLE(78); if(isFinite(bf)&&bf>100)b8=Math.round(bf); if(isFinite(af)&&af>100)a8=Math.round(af); }
       return{type:'full',secId,ltp:Math.round(l8),bid:b8,ask:a8,open:o8,high:h8,low:lw8};
     }
     return null;
-  }catch(e){return null;}
+  }catch(e){ return null; }
 }
 
 function scheduleReconnect(){
@@ -338,18 +346,16 @@ function scheduleReconnect(){
 }
 
 function connectDhan(){
-  if(!DHAN_CLIENT_ID||!currentToken){console.warn('[WS] No credentials');return;}
+  if(!DHAN_CLIENT_ID||!currentToken){ console.warn('[WS] No credentials'); return; }
   if(WS.status==='connecting'||WS.status==='connected') return;
   WS.status='connecting'; WS.lastConnectAt=new Date().toISOString();
   WS.packetsReceived=0; WS.lastRawHex='';
   buildTokenMap();
   var wsUrl='wss://api-feed.dhan.co?version=2&token='+encodeURIComponent(currentToken)+'&clientId='+encodeURIComponent(DHAN_CLIENT_ID)+'&authType=2';
   var ws=new WebSocket(wsUrl,{handshakeTimeout:15000}); WS.ws=ws;
-
-  ws.on('open',function(){WS.status='connected';WS.reconnectCount=0;console.log('[WS] Connected');subscribeWS(ws);});
-
+  ws.on('open',function(){ WS.status='connected'; WS.reconnectCount=0; console.log('[WS] Connected'); subscribeWS(ws); });
   ws.on('message',function(data){
-    if(typeof data==='string'){WS.lastTextMsg=data.slice(0,200);return;}
+    if(typeof data==='string'){ WS.lastTextMsg=data.slice(0,200); return; }
     var buf=Buffer.isBuffer(data)?data:Buffer.from(data);
     WS.packetsReceived++;
     if(WS.packetsReceived<=3) WS.lastRawHex=buf.slice(0,32).toString('hex');
@@ -363,17 +369,16 @@ function connectDhan(){
     var key=TOKEN_MAP[tick.secId]; if(!key) return;
     applyTick(key,tick); RC.source='dhan_ws_live';
   });
-
   ws.on('close',function(code){
     WS.status='disconnected'; WS.lastDisconnectAt=new Date().toISOString();
     console.warn('[WS] Closed code=%d packets=%d',code,WS.packetsReceived);
     scheduleReconnect();
   });
-  ws.on('error',function(e){console.warn('[WS] Error:',e.message);});
+  ws.on('error',function(e){ console.warn('[WS] Error:',e.message); });
 }
 
 // ─── OHLC REST BACKUP ──────────────────────────────────
-var lastOhlcError=null,ohlcCallCount=0;
+var lastOhlcError=null, ohlcCallCount=0;
 
 function pollOhlc(){
   if(!DHAN_CLIENT_ID||!currentToken) return;
@@ -384,45 +389,45 @@ function pollOhlc(){
     timeout:5000,
   }).then(function(resp){
     var seg=resp.data&&resp.data.data&&resp.data.data['MCX_COMM'];
-    if(!seg){lastOhlcError='No MCX_COMM';return;}
+    if(!seg){ lastOhlcError='No MCX_COMM'; return; }
     ohlcCallCount++; lastOhlcError=null;
     var wsLive=WS.status==='connected'&&WS.lastTickAt&&Date.now()-WS.lastTickAt<5000;
     if(wsLive) return;
     function applyRow(secId,key){
-      var row=seg[String(secId)];if(!row)return;
-      var ltp=row.last_price||0,ohlc=row.ohlc||{};
-      if(ltp>0){applyTick(key,{ltp:Math.round(ltp),open:ohlc.open?Math.round(ohlc.open):0,high:ohlc.high?Math.round(ohlc.high):0,low:ohlc.low?Math.round(ohlc.low):0});RC.source='dhan_ohlc_rest';}
+      var row=seg[String(secId)]; if(!row) return;
+      var ltp=row.last_price||0, ohlc=row.ohlc||{};
+      if(ltp>0){ applyTick(key,{ltp:Math.round(ltp),open:ohlc.open?Math.round(ohlc.open):0,high:ohlc.high?Math.round(ohlc.high):0,low:ohlc.low?Math.round(ohlc.low):0}); RC.source='dhan_ohlc_rest'; }
     }
-    applyRow(ac.gold.current.secId,'gold');applyRow(ac.gold.next.secId,'goldNext');
-    applyRow(ac.silver.current.secId,'silver');applyRow(ac.silver.next.secId,'silverNext');
-  }).catch(function(e){lastOhlcError=e.message;});
+    applyRow(ac.gold.current.secId,'gold');   applyRow(ac.gold.next.secId,'goldNext');
+    applyRow(ac.silver.current.secId,'silver'); applyRow(ac.silver.next.secId,'silverNext');
+  }).catch(function(e){ lastOhlcError=e.message; });
 }
 
 // ─── ROUTES ────────────────────────────────────────────
 app.get('/rates',function(req,res){
-  var ac=getAC(),spot=spotDerived(),now=new Date().toISOString();
-  var hasLive=RC.goldLtp>0;
+  var ac=getAC(), spot=spotDerived(), now=new Date().toISOString();
+  var hasGoldLive=RC.goldLtp>0;
+  var hasSilverLive=RC.silverLtp>0;
   res.json({
-    success:true, source:hasLive?RC.source:'spot_derived', marketOpen:isMCXOpen(),
-    goldPer10g:  Math.round((hasLive?RC.goldLtp:spot.goldPer10g)  * (1 + GOLD_MARGIN_PCT/100)),
-    silverPerKg: Math.round((hasLive?RC.silverLtp:spot.silverPerKg) * (1 + SILVER_MARGIN_PCT/100)),
+    success:true, source:(hasGoldLive||hasSilverLive)?RC.source:'spot_derived', marketOpen:isMCXOpen(),
+    goldPer10g:  Math.round((hasGoldLive?RC.goldLtp:spot.goldPer10g)   * (1+GOLD_MARGIN_PCT/100)),
+    silverPerKg: Math.round((hasSilverLive?RC.silverLtp:spot.silverPerKg) * (1+SILVER_MARGIN_PCT/100)),
     futures:{
-      gold:     {ltp:RC.goldLtp,    bid:RC.goldBid,    ask:RC.goldAsk,    high:RC.goldHigh,    low:RC.goldLow,    open:RC.goldOpen,    prevClose:RC.goldPrevClose,   contract:ac.gold.current.display,  expiry:ac.gold.current.expiry},
-      goldNext: {ltp:RC.goldNextLtp,bid:RC.goldNextBid,ask:RC.goldNextAsk,high:RC.goldNextHigh,low:RC.goldNextLow,contract:ac.gold.next.display,expiry:ac.gold.next.expiry},
-      silver:   {ltp:RC.silverLtp,  bid:RC.silverBid,  ask:RC.silverAsk,  high:RC.silverHigh,  low:RC.silverLow,  open:RC.silverOpen,  prevClose:RC.silverPrevClose, contract:ac.silver.current.display,expiry:ac.silver.current.expiry},
+      gold:      {ltp:RC.goldLtp,     bid:RC.goldBid,     ask:RC.goldAsk,     high:RC.goldHigh,     low:RC.goldLow,     open:RC.goldOpen,     prevClose:RC.goldPrevClose,     contract:ac.gold.current.display,   expiry:ac.gold.current.expiry},
+      goldNext:  {ltp:RC.goldNextLtp, bid:RC.goldNextBid, ask:RC.goldNextAsk, high:RC.goldNextHigh, low:RC.goldNextLow, contract:ac.gold.next.display,   expiry:ac.gold.next.expiry},
+      silver:    {ltp:RC.silverLtp,   bid:RC.silverBid,   ask:RC.silverAsk,   high:RC.silverHigh,   low:RC.silverLow,   open:RC.silverOpen,   prevClose:RC.silverPrevClose,   contract:ac.silver.current.display, expiry:ac.silver.current.expiry},
       silverNext:{ltp:RC.silverNextLtp,bid:RC.silverNextBid,ask:RC.silverNextAsk,high:RC.silverNextHigh,low:RC.silverNextLow,contract:ac.silver.next.display,expiry:ac.silver.next.expiry},
     },
     spot:{
       xauUsd:FX.xauUsd, xauBid:FX.xauBid, xauAsk:FX.xauAsk, xauHigh:FX.xauHigh, xauLow:FX.xauLow,
       xagUsd:FX.xagUsd, xagBid:FX.xagBid, xagAsk:FX.xagAsk, xagHigh:FX.xagHigh, xagLow:FX.xagLow,
       usdInr:FX.usdInr,
-      usdInrHigh: FX.usdInrHigh || null,
-      usdInrLow:  FX.usdInrLow === Infinity ? null : FX.usdInrLow,
+      usdInrHigh:FX.usdInrHigh||null,
+      usdInrLow:FX.usdInrLow===Infinity?null:FX.usdInrLow,
     },
-    // Legacy fields for HTML compatibility
     xauUsd:FX.xauUsd, xagUsd:FX.xagUsd, usdInr:FX.usdInr,
     spotDerived:spot,
-    marginApplied:{ gold:GOLD_MARGIN_PCT, silver:SILVER_MARGIN_PCT },
+    marginApplied:{gold:GOLD_MARGIN_PCT,silver:SILVER_MARGIN_PCT},
     wsStatus:WS.status, wsTickAgeMs:WS.lastTickAt?Date.now()-WS.lastTickAt:null,
     tdStatus:TDws.status,
     updatedAt:RC.updatedAt, forexUpdatedAt:FX.updatedAt, timestamp:now,
@@ -431,7 +436,7 @@ app.get('/rates',function(req,res){
 
 app.get('/debug',function(req,res){
   res.json({
-    server:'RR Jewellers v10',
+    server:'RR Jewellers v10.1',
     dhan:{wsStatus:WS.status,packets:WS.packetsReceived,tickAgeMs:WS.lastTickAt?Date.now()-WS.lastTickAt:null,reconnects:WS.reconnectCount,lastConnect:WS.lastConnectAt},
     twelveData:{wsStatus:TDws.status,packets:TDws.packetsReceived,hasKey:!!TWELVE_DATA_KEY,xauUpdatedAt:FX.xauUpdatedAt,xagUpdatedAt:FX.xagUpdatedAt},
     ohlc:{calls:ohlcCallCount,lastError:lastOhlcError},
@@ -442,12 +447,9 @@ app.get('/debug',function(req,res){
   });
 });
 
-app.get('/token-renew',async function(req,res){
-  var ok=await renewToken();
-  res.json({success:ok,tokenRenewedAt,wsStatus:WS.status});
-});
-app.get('/spot-test',function(req,res){res.json({spot:spotDerived(),forex:FX,tdStatus:TDws.status});});
-app.get('/ping',function(req,res){res.json({ok:true,ts:Date.now()});});
+app.get('/token-renew',async function(req,res){ var ok=await renewToken(); res.json({success:ok,tokenRenewedAt,wsStatus:WS.status}); });
+app.get('/spot-test',function(req,res){ res.json({spot:spotDerived(),forex:FX,tdStatus:TDws.status}); });
+app.get('/ping',function(req,res){ res.json({ok:true,ts:Date.now()}); });
 
 app.get('/updates',async function(req,res){
   try{
@@ -458,25 +460,23 @@ app.get('/updates',async function(req,res){
     var data=JSON.parse(json);
     var rows=data.table.rows.map(function(row){return{date:row.c[0]?.v||'',title:row.c[1]?.v||'',content:row.c[2]?.v||'',image:row.c[3]?.v||''};});
     res.json({success:true,updates:rows.filter(function(r){return r.title;})});
-  }catch(e){res.json({success:true,updates:[{date:'Today',title:'Welcome to R.R. Jewellers',content:'Live gold & silver rates.',image:''}]});}
+  }catch(e){ res.json({success:true,updates:[{date:'Today',title:'Welcome to R.R. Jewellers',content:'Live gold & silver rates.',image:''}]}); }
 });
 
-app.get('/',function(req,res){res.json({status:'RR Jewellers v10',dhanWS:WS.status,tdWS:TDws.status,endpoints:['/rates','/debug','/ping','/token-renew','/spot-test','/updates']});});
+app.get('/',function(req,res){ res.json({status:'RR Jewellers v10.1',dhanWS:WS.status,tdWS:TDws.status,endpoints:['/rates','/debug','/ping','/token-renew','/spot-test','/updates']}); });
 
 // ─── STARTUP ───────────────────────────────────────────
 app.listen(PORT,'0.0.0.0',async function(){
-  console.log('[STARTUP] RR Jewellers v10 port=%s',PORT);
-
+  console.log('[STARTUP] RR Jewellers v10.1 port=%s',PORT);
   var renewed=await renewToken();
   if(!renewed) currentToken=DHAN_ACCESS_TOKEN;
-
   await refreshUsdInr();
   connectDhan();
   connectTwelveData();
-
+  refreshSpotOHLC();
+  setInterval(refreshSpotOHLC,5*60*1000);
   setInterval(function(){if(isMCXOpen()) pollOhlc();},1000);
   setInterval(refreshUsdInr,5*60*1000);
-  // Spot REST fallback refresh every 30s (when no Twelve Data key)
   if(!TWELVE_DATA_KEY) setInterval(refreshSpotREST,30*1000);
   setInterval(function(){if(WS.status==='disconnected'&&!WS.reconnectTimer)connectDhan();},30*1000);
   setInterval(function(){axios.get((SELF_URL||'http://localhost:'+PORT)+'/ping').catch(function(){});},4*60*1000);
