@@ -21,10 +21,6 @@ const SHEET_ID           = process.env.SHEET_ID           || '';
 const DHAN_CLIENT_ID     = process.env.DHAN_CLIENT_ID     || '';
 const DHAN_ACCESS_TOKEN  = process.env.DHAN_ACCESS_TOKEN  || '';
 const TWELVE_DATA_KEY    = process.env.TWELVE_DATA_KEY    || ''; // twelvedata.com free key
-// Twelve Data credit budget: 800/day total
-// XAG/USD REST every 3min = 480 calls/day
-// USD/INR /quote every 15min = 96 calls/day
-// Total = 576/day — safely within 800
 // Shop margin % added to MCX rate before sending to HTML
 // Set in Render Dashboard → Environment
 // Example: GOLD_MARGIN_PCT=1.00 means Gold sell rate = MCX × 1.01
@@ -112,8 +108,7 @@ var FX = {
   usdInr:94.5, xauUsd:0, xagUsd:0,
   xauBid:0, xauAsk:0, xauHigh:0, xauLow:0,
   xagBid:0, xagAsk:0, xagHigh:0, xagLow:0,
-  usdInrBid:0, usdInrAsk:0,
-  usdInrHigh:0, usdInrLow:Infinity,
+  usdInrHigh:0, usdInrLow:Infinity,  // session high/low
   updatedAt:null, src:'init',
   xauUpdatedAt:null, xagUpdatedAt:null,
 };
@@ -220,77 +215,14 @@ function connectTwelveData(){
   ws.on('error',function(e){ console.warn('[TD] Error:',e.message); });
 }
 
-// ── Twelve Data REST: XAG/USD every 3 min (480 credits/day) ──────────
-// XAG/USD is NOT available on free WS tier — must use REST
-var xagPollCount = 0;
-async function pollXagUsdTD(){
-  if(!TWELVE_DATA_KEY) return;
-  try{
-    var r=await axios.get('https://api.twelvedata.com/price',{
-      params:{symbol:'XAG/USD',apikey:TWELVE_DATA_KEY},
-      timeout:5000,
-    });
-    var p=parseFloat(r.data?.price);
-    if(p>20&&p<300){
-      FX.xagUsd=Math.round(p*1000)/1000;
-      // Rough bid/ask spread for silver spot (~0.04 typical)
-      FX.xagBid=Math.round((p-0.02)*1000)/1000;
-      FX.xagAsk=Math.round((p+0.02)*1000)/1000;
-      if(!FX.xagHigh||p>FX.xagHigh) FX.xagHigh=Math.round(p*1000)/1000;
-      if(!FX.xagLow||p<FX.xagLow)   FX.xagLow=Math.round(p*1000)/1000;
-      FX.xagUpdatedAt=new Date().toISOString();
-      xagPollCount++;
-      if(xagPollCount<=3||xagPollCount%10===0)
-        console.log('[XAG/REST] p=%s bid=%s ask=%s calls=%d',p,FX.xagBid,FX.xagAsk,xagPollCount);
-    }
-  }catch(e){console.warn('[XAG/REST]',e.message.slice(0,60));}
-}
-
-// ── Twelve Data /quote: USD/INR H/L every 15 min (96 credits/day) ────
-// Gets accurate daily high/low from provider-aggregated quote data
-async function pollUsdInrQuoteTD(){
-  if(!TWELVE_DATA_KEY) return;
-  try{
-    var r=await axios.get('https://api.twelvedata.com/quote',{
-      params:{symbol:'USD/INR',apikey:TWELVE_DATA_KEY},
-      timeout:6000,
-    });
-    var d=r.data;
-    if(d&&d.high&&d.low&&d.close){
-      var high=parseFloat(d.high), low=parseFloat(d.low), close=parseFloat(d.close);
-      if(high>70&&high<110&&low>70&&low<110){
-        // Use provider's daily high/low (more accurate than our 5-min snapshots)
-        if(!FX.usdInrHigh||high>FX.usdInrHigh) FX.usdInrHigh=Math.round(high*100)/100;
-        if(FX.usdInrLow===Infinity||low<FX.usdInrLow) FX.usdInrLow=Math.round(low*100)/100;
-        // Also update bid/ask from quote (ask = offer, bid = close approx)
-        if(parseFloat(d.ask)>70) FX.usdInrAsk=Math.round(parseFloat(d.ask)*100)/100;
-        if(parseFloat(d.bid)>70) FX.usdInrBid=Math.round(parseFloat(d.bid)*100)/100;
-        console.log('[USDINR/QUOTE] H=%s L=%s close=%s',high,low,close);
-      }
-    }
-  }catch(e){console.warn('[USDINR/QUOTE]',e.message.slice(0,60));}
-}
-
 // REST fallback when no Twelve Data key
 async function refreshSpotREST(){
   try{
     var r=await axios.get('https://api.metals.live/v1/spot/gold,silver',{timeout:6000});
     if(Array.isArray(r.data)){
       var g=r.data.find(function(x){return x.gold;}),s=r.data.find(function(x){return x.silver;});
-      if(g&&g.gold>3000){
-        FX.xauUsd=Math.round(g.gold*100)/100;
-        FX.xauBid=Math.round((FX.xauUsd-0.50)*100)/100;
-        FX.xauAsk=Math.round((FX.xauUsd+0.50)*100)/100;
-        if(!FX.xauHigh||FX.xauUsd>FX.xauHigh) FX.xauHigh=FX.xauUsd;
-        if(!FX.xauLow||FX.xauUsd<FX.xauLow)   FX.xauLow=FX.xauUsd;
-      }
-      if(s&&s.silver>20){
-        FX.xagUsd=Math.round(s.silver*1000)/1000;
-        FX.xagBid=Math.round((FX.xagUsd-0.02)*1000)/1000;
-        FX.xagAsk=Math.round((FX.xagUsd+0.02)*1000)/1000;
-        if(!FX.xagHigh||FX.xagUsd>FX.xagHigh) FX.xagHigh=FX.xagUsd;
-        if(!FX.xagLow||FX.xagUsd<FX.xagLow)   FX.xagLow=FX.xagUsd;
-      }
+      if(g&&g.gold>3000){FX.xauUsd=Math.round(g.gold*100)/100;}
+      if(s&&s.silver>20){FX.xagUsd=Math.round(s.silver*1000)/1000;}
       FX.xauUpdatedAt=new Date().toISOString();
       FX.xagUpdatedAt=new Date().toISOString();
       return;
@@ -484,8 +416,6 @@ app.get('/rates',function(req,res){
       xauUsd:FX.xauUsd, xauBid:FX.xauBid, xauAsk:FX.xauAsk, xauHigh:FX.xauHigh, xauLow:FX.xauLow,
       xagUsd:FX.xagUsd, xagBid:FX.xagBid, xagAsk:FX.xagAsk, xagHigh:FX.xagHigh, xagLow:FX.xagLow,
       usdInr:FX.usdInr,
-      usdInrBid:  FX.usdInrBid  || null,
-      usdInrAsk:  FX.usdInrAsk  || null,
       usdInrHigh: FX.usdInrHigh || null,
       usdInrLow:  FX.usdInrLow === Infinity ? null : FX.usdInrLow,
     },
@@ -548,16 +478,6 @@ app.listen(PORT,'0.0.0.0',async function(){
   setInterval(refreshUsdInr,5*60*1000);
   // Spot REST fallback refresh every 30s (when no Twelve Data key)
   if(!TWELVE_DATA_KEY) setInterval(refreshSpotREST,30*1000);
-  // Twelve Data REST: XAG/USD every 3 min (480 credits/day)
-  if(TWELVE_DATA_KEY){
-    pollXagUsdTD(); // immediate first call
-    setInterval(pollXagUsdTD, 3*60*1000);
-  }
-  // Twelve Data /quote: USD/INR H/L every 15 min (96 credits/day)
-  if(TWELVE_DATA_KEY){
-    pollUsdInrQuoteTD(); // immediate first call
-    setInterval(pollUsdInrQuoteTD, 15*60*1000);
-  }
   setInterval(function(){if(WS.status==='disconnected'&&!WS.reconnectTimer)connectDhan();},30*1000);
   setInterval(function(){axios.get((SELF_URL||'http://localhost:'+PORT)+'/ping').catch(function(){});},4*60*1000);
   setInterval(function(){buildTokenMap();},24*60*60*1000);
