@@ -21,6 +21,11 @@ const SHEET_ID           = process.env.SHEET_ID           || '';
 const DHAN_CLIENT_ID     = process.env.DHAN_CLIENT_ID     || '';
 const DHAN_ACCESS_TOKEN  = process.env.DHAN_ACCESS_TOKEN  || '';
 const TWELVE_DATA_KEY    = process.env.TWELVE_DATA_KEY    || ''; // twelvedata.com free key
+// Shop margin % added to MCX rate before sending to HTML
+// Set in Render Dashboard → Environment
+// Example: GOLD_MARGIN_PCT=1.00 means Gold sell rate = MCX × 1.01
+const GOLD_MARGIN_PCT    = parseFloat(process.env.GOLD_MARGIN_PCT   || '0');
+const SILVER_MARGIN_PCT  = parseFloat(process.env.SILVER_MARGIN_PCT || '0');
 const DHAN_BASE          = 'https://api.dhan.co/v2';
 
 // ─── MCX CONTRACTS ─────────────────────────────────────
@@ -103,7 +108,7 @@ var FX = {
   usdInr:94.5, xauUsd:0, xagUsd:0,
   xauBid:0, xauAsk:0, xauHigh:0, xauLow:0,
   xagBid:0, xagAsk:0, xagHigh:0, xagLow:0,
-  usdInrHigh:0, usdInrLow:0,
+  usdInrHigh:0, usdInrLow:Infinity,  // session high/low
   updatedAt:null, src:'init',
   xauUpdatedAt:null, xagUpdatedAt:null,
 };
@@ -129,9 +134,14 @@ async function refreshUsdInr(){
   }
   if(!v){v=FX.usdInr;src='cached';}
   FX.usdInr=Math.round(v*100)/100;
+  // Track session High/Low for USD/INR
+  if (FX.usdInr > 0) {
+    if (!FX.usdInrHigh || FX.usdInr > FX.usdInrHigh) FX.usdInrHigh = FX.usdInr;
+    if (FX.usdInrLow === Infinity || FX.usdInr < FX.usdInrLow) FX.usdInrLow = FX.usdInr;
+  }
   FX.updatedAt=new Date().toISOString();
   FX.src=src;
-  console.log('[FOREX] usdInr=%s src=%s',FX.usdInr,FX.src);
+  console.log('[FOREX] usdInr=%s H=%s L=%s src=%s',FX.usdInr,FX.usdInrHigh,FX.usdInrLow,FX.src);
 }
 
 // ─── TWELVE DATA WEBSOCKET (XAU/USD + XAG/USD) ─────────
@@ -394,8 +404,8 @@ app.get('/rates',function(req,res){
   var hasLive=RC.goldLtp>0;
   res.json({
     success:true, source:hasLive?RC.source:'spot_derived', marketOpen:isMCXOpen(),
-    goldPer10g:  hasLive?RC.goldLtp:spot.goldPer10g,
-    silverPerKg: hasLive?RC.silverLtp:spot.silverPerKg,
+    goldPer10g:  Math.round((hasLive?RC.goldLtp:spot.goldPer10g)  * (1 + GOLD_MARGIN_PCT/100)),
+    silverPerKg: Math.round((hasLive?RC.silverLtp:spot.silverPerKg) * (1 + SILVER_MARGIN_PCT/100)),
     futures:{
       gold:     {ltp:RC.goldLtp,    bid:RC.goldBid,    ask:RC.goldAsk,    high:RC.goldHigh,    low:RC.goldLow,    open:RC.goldOpen,    prevClose:RC.goldPrevClose,   contract:ac.gold.current.display,  expiry:ac.gold.current.expiry},
       goldNext: {ltp:RC.goldNextLtp,bid:RC.goldNextBid,ask:RC.goldNextAsk,high:RC.goldNextHigh,low:RC.goldNextLow,contract:ac.gold.next.display,expiry:ac.gold.next.expiry},
@@ -405,11 +415,14 @@ app.get('/rates',function(req,res){
     spot:{
       xauUsd:FX.xauUsd, xauBid:FX.xauBid, xauAsk:FX.xauAsk, xauHigh:FX.xauHigh, xauLow:FX.xauLow,
       xagUsd:FX.xagUsd, xagBid:FX.xagBid, xagAsk:FX.xagAsk, xagHigh:FX.xagHigh, xagLow:FX.xagLow,
-      usdInr:FX.usdInr, usdInrHigh:FX.usdInrHigh, usdInrLow:FX.usdInrLow,
+      usdInr:FX.usdInr,
+      usdInrHigh: FX.usdInrHigh || null,
+      usdInrLow:  FX.usdInrLow === Infinity ? null : FX.usdInrLow,
     },
     // Legacy fields for HTML compatibility
     xauUsd:FX.xauUsd, xagUsd:FX.xagUsd, usdInr:FX.usdInr,
     spotDerived:spot,
+    marginApplied:{ gold:GOLD_MARGIN_PCT, silver:SILVER_MARGIN_PCT },
     wsStatus:WS.status, wsTickAgeMs:WS.lastTickAt?Date.now()-WS.lastTickAt:null,
     tdStatus:TDws.status,
     updatedAt:RC.updatedAt, forexUpdatedAt:FX.updatedAt, timestamp:now,
