@@ -1,10 +1,11 @@
 'use strict';
-// RR Jewellers v12.1 — Corrected data sources
-// XAU/USD : Twelve Data WebSocket (live ticks) ← keep
-// XAG/USD : gold-api.com (primary, no key) + metals.live fallback, REST every 2min
-// USD/INR : frankfurter.dev + open.er-api.com + fawazahmed0, REST every 5min
-// MCX     : Dhan WS, RC15 Ticker + RC17 Quote
-// NOTE    : Dhan discontinued Currency segment Jul 2024 (RBI circular) — no USDINR from Dhan
+// RR Jewellers v12.2 — Correct daily H/L for spot section
+// FIX: XAU/XAG/USDINR daily High/Low now from TD /quote batch (every 10min)
+//      WS tick accumulation gave wrong H/L (only since server start, not market open)
+// XAU/USD : Twelve Data WebSocket (live price) + /quote for daily H/L
+// XAG/USD : gold-api.com primary + TD /quote H/L + metals.live fallback
+// USD/INR : frankfurter REST every 5min + TD /quote for daily H/L
+// MCX     : Dhan WS RC15+RC17
 
 const express   = require('express');
 const cors      = require('cors');
@@ -266,20 +267,76 @@ async function pollXagUsd(){
   }catch(e){console.warn('[XAG] metals.live fail:',e.message.slice(0,50));}
 }
 
-// USD/INR H/L from TD /quote every 15min
-async function pollUsdInrQuoteTD(){
+// ── TWELVE DATA /quote — daily H/L for XAU, XAG, USD/INR ──
+// One batch call = 3 credits. Runs every 10 min.
+// This is the ONLY source for accurate daily high/low — 
+// running WS tick accumulation gives wrong values (only since server start, not since market open)
+async function pollSpotQuoteTD(){
   if(!TWELVE_DATA_KEY) return;
+  // Batch: comma-separated symbols = 1 request, 3 credits
   try{
-    var r=await axios.get('https://api.twelvedata.com/quote',{params:{symbol:'USD/INR',apikey:TWELVE_DATA_KEY},timeout:8000});
-    var q=r.data;
-    if(q&&q.high&&q.low){
-      var hi=parseFloat(q.high),lo=parseFloat(q.low);
-      if(hi>70&&hi<115) FX.usdInrHigh=Math.round(hi*100)/100;
-      if(lo>70&&lo<115) FX.usdInrLow=Math.round(lo*100)/100;
-      if(q.bid) FX.usdInrBid=Math.round(parseFloat(q.bid)*100)/100;
-      if(q.ask) FX.usdInrAsk=Math.round(parseFloat(q.ask)*100)/100;
+    var r=await axios.get('https://api.twelvedata.com/quote',{
+      params:{symbol:'XAU/USD,XAG/USD,USD/INR',apikey:TWELVE_DATA_KEY},
+      timeout:10000,
+    });
+    var data=r.data;
+    // Response is object keyed by symbol when batch
+    var xau = data['XAU/USD']||data;  // fallback if single symbol returned
+    var xag = data['XAG/USD'];
+    var inr = data['USD/INR'];
+
+    // XAU/USD daily H/L
+    if(xau&&xau.high&&xau.low){
+      var h=parseFloat(xau.high),l=parseFloat(xau.low);
+      if(h>3000&&h<9000) FX.xauHigh=Math.round(h*100)/100;
+      if(l>3000&&l<9000) FX.xauLow=Math.round(l*100)/100;
+      // Also update price/bid/ask if fresher than WS
+      if(xau.close&&parseFloat(xau.close)>3000&&!FX.xauUsd){
+        FX.xauUsd=Math.round(parseFloat(xau.close)*100)/100;
+      }
+      console.log('[TD-QUOTE] XAU H=%s L=%s',FX.xauHigh,FX.xauLow);
     }
-  }catch(e){}
+
+    // XAG/USD daily H/L + price
+    if(xag&&xag.high&&xag.low){
+      var ah=parseFloat(xag.high),al=parseFloat(xag.low),ap=parseFloat(xag.close||xag.open||0);
+      if(ah>20&&ah<300) FX.xagHigh=Math.round(ah*1000)/1000;
+      if(al>20&&al<300) FX.xagLow=Math.round(al*1000)/1000;
+      if(ap>20&&ap<300&&!FX.xagUsd){
+        FX.xagUsd=Math.round(ap*1000)/1000;
+        FX.xagBid=Math.round((ap-0.02)*1000)/1000;
+        FX.xagAsk=Math.round((ap+0.02)*1000)/1000;
+        FX.xagUpdatedAt=new Date().toISOString();
+      }
+      console.log('[TD-QUOTE] XAG=%s H=%s L=%s',FX.xagUsd,FX.xagHigh,FX.xagLow);
+    }
+
+    // USD/INR daily H/L + bid/ask
+    if(inr&&inr.high&&inr.low){
+      var ih=parseFloat(inr.high),il=parseFloat(inr.low);
+      if(ih>70&&ih<115) FX.usdInrHigh=Math.round(ih*100)/100;
+      if(il>70&&il<115) FX.usdInrLow=Math.round(il*100)/100;
+      if(inr.bid&&parseFloat(inr.bid)>70)  FX.usdInrBid=Math.round(parseFloat(inr.bid)*100)/100;
+      if(inr.ask&&parseFloat(inr.ask)>70)  FX.usdInrAsk=Math.round(parseFloat(inr.ask)*100)/100;
+      console.log('[TD-QUOTE] INR H=%s L=%s bid=%s ask=%s',FX.usdInrHigh,FX.usdInrLow,FX.usdInrBid,FX.usdInrAsk);
+    }
+
+    broadcast();
+  }catch(e){
+    console.warn('[TD-QUOTE] batch fail:',e.message.slice(0,80));
+    // Fallback: try individual USD/INR quote only
+    try{
+      var r2=await axios.get('https://api.twelvedata.com/quote',{params:{symbol:'USD/INR',apikey:TWELVE_DATA_KEY},timeout:8000});
+      var q=r2.data;
+      if(q&&q.high&&q.low){
+        var hi=parseFloat(q.high),lo=parseFloat(q.low);
+        if(hi>70&&hi<115) FX.usdInrHigh=Math.round(hi*100)/100;
+        if(lo>70&&lo<115) FX.usdInrLow=Math.round(lo*100)/100;
+        if(q.bid) FX.usdInrBid=Math.round(parseFloat(q.bid)*100)/100;
+        if(q.ask) FX.usdInrAsk=Math.round(parseFloat(q.ask)*100)/100;
+      }
+    }catch(e2){}
+  }
 }
 
 // Twelve Data WS — XAU/USD live
@@ -307,8 +364,8 @@ function connectTwelveData(){
           FX.xauUsd=Math.round(p*100)/100;
           FX.xauBid=Math.round(b*100)/100;
           FX.xauAsk=Math.round(a*100)/100;
-          if(!FX.xauHigh||p>FX.xauHigh) FX.xauHigh=Math.round(p*100)/100;
-          if(!FX.xauLow||p<FX.xauLow)   FX.xauLow=Math.round(p*100)/100;
+          // NOTE: xauHigh/xauLow intentionally NOT updated here
+          // They come from TD /quote (daily H/L), not running tick accumulation
           FX.xauUpdatedAt=new Date().toISOString();
           TDws.packetsReceived++;
           broadcast();
@@ -577,10 +634,11 @@ server.listen(PORT,'0.0.0.0',async function(){
   pollXagUsd();
   setInterval(pollXagUsd, 2*60*1000);
 
-  // USD/INR H/L from TD quote every 15min
+  // USD/INR + XAU/XAG daily H/L from TD /quote — every 10min
+  // This is what gives accurate daily High/Low for spot section
   if(TWELVE_DATA_KEY){
-    pollUsdInrQuoteTD();
-    setInterval(pollUsdInrQuoteTD,15*60*1000);
+    pollSpotQuoteTD();
+    setInterval(pollSpotQuoteTD, 10*60*1000);
   }
 
   // REST spot fallback (no TD key)
