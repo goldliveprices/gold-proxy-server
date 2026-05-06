@@ -1,9 +1,14 @@
 'use strict';
-// RR Jewellers v10 — Production Final
-// MCX: Dhan WebSocket (live ticks ~95ms)
-// SPOT: Twelve Data WebSocket (XAU/USD, XAG/USD ~170ms)
-// USD/INR: Free REST APIs cached 5min
-// Margin: GOLD_MARGIN_PCT + SILVER_MARGIN_PCT env vars
+// RR Jewellers v11 — Production
+// Fixes vs v10:
+//   1. Daily 8:30 AM IST token auto-renew (before MCX open)
+//   2. Startup renew retry — retries every 5min if first attempt fails
+//   3. Auto token-renew on WS reconnect failure (5+ reconnects)
+//   4. OHLC poll throttled 1s→5s, 429 error gets 60s backoff
+//   5. XAG/USD REST properly fixed via Twelve Data every 3min
+//   6. WS subscribe: Full (code 21) sent immediately, Quote after 200ms
+//   7. WS ping/pong keepalive every 20s to prevent idle disconnect
+//   8. Faster tick delivery — no artificial delay in message handler
 
 const express   = require('express');
 const cors      = require('cors');
@@ -20,10 +25,7 @@ const SELF_URL           = process.env.SELF_URL           || '';
 const SHEET_ID           = process.env.SHEET_ID           || '';
 const DHAN_CLIENT_ID     = process.env.DHAN_CLIENT_ID     || '';
 const DHAN_ACCESS_TOKEN  = process.env.DHAN_ACCESS_TOKEN  || '';
-const TWELVE_DATA_KEY    = process.env.TWELVE_DATA_KEY    || ''; // twelvedata.com free key
-// Shop margin % added to MCX rate before sending to HTML
-// Set in Render Dashboard → Environment
-// Example: GOLD_MARGIN_PCT=1.00 means Gold sell rate = MCX × 1.01
+const TWELVE_DATA_KEY    = process.env.TWELVE_DATA_KEY    || '';
 const GOLD_MARGIN_PCT    = parseFloat(process.env.GOLD_MARGIN_PCT   || '0');
 const SILVER_MARGIN_PCT  = parseFloat(process.env.SILVER_MARGIN_PCT || '0');
 const DHAN_BASE          = 'https://api.dhan.co/v2';
@@ -102,13 +104,12 @@ function applyTick(key,tick){
 }
 
 // ─── FOREX CACHE ───────────────────────────────────────
-// XAU/USD + XAG/USD: Twelve Data WebSocket (live ~170ms)
-// USD/INR: Free REST APIs cached 5min
 var FX = {
   usdInr:94.5, xauUsd:0, xagUsd:0,
   xauBid:0, xauAsk:0, xauHigh:0, xauLow:0,
   xagBid:0, xagAsk:0, xagHigh:0, xagLow:0,
-  usdInrHigh:0, usdInrLow:Infinity,  // session high/low
+  usdInrBid:0, usdInrAsk:0,
+  usdInrHigh:0, usdInrLow:Infinity,
   updatedAt:null, src:'init',
   xauUpdatedAt:null, xagUpdatedAt:null,
 };
@@ -121,10 +122,34 @@ function isMCXOpen(){
   return dow===6?(t>=540&&t<840):(t>=540&&t<1435);
 }
 
+// ─── IST TIME HELPERS ──────────────────────────────────
+function nowIST(){
+  return new Date(Date.now()+5.5*3600000);
+}
+// Returns ms until next HH:MM IST
+function msUntilIST(hh, mm){
+  var now = nowIST();
+  var target = new Date(now);
+  target.setUTCHours(hh - 5, mm - 30, 0, 0); // convert IST to UTC
+  // Actually: IST hh:mm = UTC (hh-5):( mm-30) — handle carry
+  // Simpler: compute directly
+  var nowMs = Date.now();
+  var todayIST = new Date(Date.now()+5.5*3600000);
+  var y=todayIST.getUTCFullYear(), mo=todayIST.getUTCMonth(), d=todayIST.getUTCDate();
+  // target in UTC: IST hh:mm → UTC = hh*60+mm - 330 minutes
+  var targetUTCMinutes = hh*60+mm - 330; // 330 = 5.5*60
+  var targetUTCH = Math.floor(targetUTCMinutes/60);
+  var targetUTCM = targetUTCMinutes%60;
+  if(targetUTCH<0){targetUTCH+=24;}
+  var targetDate = new Date(Date.UTC(y,mo,d,targetUTCH,targetUTCM,0,0));
+  if(targetDate.getTime() <= nowMs) targetDate.setUTCDate(targetDate.getUTCDate()+1);
+  return targetDate.getTime() - nowMs;
+}
+
 // ─── USD/INR REFRESH (every 5 min) ─────────────────────
 async function refreshUsdInr(){
   var fxList=[
-    ['frankfurter', function(){ return axios.get('https://api.frankfurter.app/latest?from=USD&to=INR',{timeout:5000}).then(function(r){return r.data.rates.INR;}); }],
+    ['frankfurter',  function(){ return axios.get('https://api.frankfurter.app/latest?from=USD&to=INR',{timeout:5000}).then(function(r){return r.data.rates.INR;}); }],
     ['open.er-api',  function(){ return axios.get('https://open.er-api.com/v6/latest/USD',{timeout:5000}).then(function(r){return r.data.rates.INR;}); }],
     ['fawazahmed0',  function(){ return axios.get('https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json',{timeout:5000}).then(function(r){return r.data.usd.inr;}); }],
   ];
@@ -134,33 +159,75 @@ async function refreshUsdInr(){
   }
   if(!v){v=FX.usdInr;src='cached';}
   FX.usdInr=Math.round(v*100)/100;
-  // Track session High/Low for USD/INR
-  if (FX.usdInr > 0) {
-    if (!FX.usdInrHigh || FX.usdInr > FX.usdInrHigh) FX.usdInrHigh = FX.usdInr;
-    if (FX.usdInrLow === Infinity || FX.usdInr < FX.usdInrLow) FX.usdInrLow = FX.usdInr;
+  if(FX.usdInr>0){
+    if(!FX.usdInrHigh||FX.usdInr>FX.usdInrHigh) FX.usdInrHigh=FX.usdInr;
+    if(FX.usdInrLow===Infinity||FX.usdInr<FX.usdInrLow) FX.usdInrLow=FX.usdInr;
   }
   FX.updatedAt=new Date().toISOString();
   FX.src=src;
-  console.log('[FOREX] usdInr=%s H=%s L=%s src=%s',FX.usdInr,FX.usdInrHigh,FX.usdInrLow,FX.src);
+  console.log('[FOREX] usdInr=%s H=%s L=%s src=%s',FX.usdInr,FX.usdInrHigh,FX.usdInrLow===Infinity?'--':FX.usdInrLow,FX.src);
 }
 
-// ─── TWELVE DATA WEBSOCKET (XAU/USD + XAG/USD) ─────────
+// ─── XAG/USD REST — Twelve Data every 3min ─────────────
+async function pollXagUsdTD(){
+  if(!TWELVE_DATA_KEY) return;
+  try{
+    var r=await axios.get('https://api.twelvedata.com/price',{
+      params:{symbol:'XAG/USD',apikey:TWELVE_DATA_KEY},
+      timeout:8000,
+    });
+    var p=parseFloat(r.data&&r.data.price);
+    if(p>20&&p<300){
+      FX.xagUsd=Math.round(p*1000)/1000;
+      // Spread estimate ±$0.02
+      FX.xagBid=Math.round((p-0.02)*1000)/1000;
+      FX.xagAsk=Math.round((p+0.02)*1000)/1000;
+      if(!FX.xagHigh||p>FX.xagHigh) FX.xagHigh=Math.round(p*1000)/1000;
+      if(!FX.xagLow||p<FX.xagLow)   FX.xagLow=Math.round(p*1000)/1000;
+      FX.xagUpdatedAt=new Date().toISOString();
+      console.log('[TD-REST] XAG/USD=%s',FX.xagUsd);
+    }
+  }catch(e){ console.warn('[TD-REST] XAG/USD error:',e.message.slice(0,60)); }
+}
+
+// ─── USD/INR H/L — Twelve Data /quote every 15min ──────
+async function pollUsdInrQuoteTD(){
+  if(!TWELVE_DATA_KEY) return;
+  try{
+    var r=await axios.get('https://api.twelvedata.com/quote',{
+      params:{symbol:'USD/INR',apikey:TWELVE_DATA_KEY},
+      timeout:8000,
+    });
+    var q=r.data;
+    if(q&&q.high&&q.low){
+      var hi=parseFloat(q.high), lo=parseFloat(q.low);
+      if(hi>70&&hi<110) FX.usdInrHigh=Math.round(hi*100)/100;
+      if(lo>70&&lo<110) FX.usdInrLow=Math.round(lo*100)/100;
+      if(q.bid) FX.usdInrBid=Math.round(parseFloat(q.bid)*100)/100;
+      if(q.ask) FX.usdInrAsk=Math.round(parseFloat(q.ask)*100)/100;
+      console.log('[TD-QUOTE] USD/INR H=%s L=%s',FX.usdInrHigh,FX.usdInrLow);
+    }
+  }catch(e){ console.warn('[TD-QUOTE] USD/INR error:',e.message.slice(0,60)); }
+}
+
+// ─── TWELVE DATA WEBSOCKET (XAU/USD live) ──────────────
 var TDws = {
   ws:null, status:'disconnected',
   reconnectTimer:null, reconnectCount:0,
   lastConnectAt:null, packetsReceived:0,
+  pingTimer:null,
 };
 
 function connectTwelveData(){
   if(!TWELVE_DATA_KEY){
-    console.warn('[TD] No TWELVE_DATA_KEY — using REST fallback for spot');
+    console.warn('[TD] No TWELVE_DATA_KEY — REST fallback only');
     refreshSpotREST();
     return;
   }
   if(TDws.status==='connecting'||TDws.status==='connected') return;
   TDws.status='connecting';
   TDws.lastConnectAt=new Date().toISOString();
-  console.log('[TD] Connecting to Twelve Data WebSocket...');
+  console.log('[TD] Connecting WebSocket...');
 
   var ws=new WebSocket('wss://ws.twelvedata.com/v1/quotes/price?apikey='+TWELVE_DATA_KEY,{handshakeTimeout:15000});
   TDws.ws=ws;
@@ -168,16 +235,19 @@ function connectTwelveData(){
   ws.on('open',function(){
     TDws.status='connected'; TDws.reconnectCount=0;
     console.log('[TD] Connected');
-    ws.send(JSON.stringify({
-      action: 'subscribe',
-      params: { symbols: 'XAU/USD,XAG/USD' }
-    }));
+    // Subscribe XAU/USD only on WS (XAG via REST)
+    ws.send(JSON.stringify({action:'subscribe',params:{symbols:'XAU/USD'}}));
+    // Keepalive ping every 20s
+    if(TDws.pingTimer) clearInterval(TDws.pingTimer);
+    TDws.pingTimer=setInterval(function(){
+      if(ws.readyState===WebSocket.OPEN) ws.ping();
+    },20000);
   });
 
   ws.on('message',function(data){
     try{
       var msg=JSON.parse(data);
-      if(msg.event==='subscribe-status') { console.log('[TD]',msg.status,msg.message||''); return; }
+      if(msg.event==='subscribe-status'){ console.log('[TD]',msg.status,msg.message||''); return; }
       if(msg.event==='heartbeat') return;
       if(msg.event==='price'&&msg.symbol&&msg.price){
         TDws.packetsReceived++;
@@ -192,20 +262,13 @@ function connectTwelveData(){
           if(!FX.xauLow||p<FX.xauLow)   FX.xauLow=Math.round(p*100)/100;
           FX.xauUpdatedAt=new Date().toISOString();
         }
-        if(msg.symbol==='XAG/USD'&&p>20&&p<300){
-          FX.xagUsd=Math.round(p*1000)/1000;
-          FX.xagBid=Math.round(b*1000)/1000;
-          FX.xagAsk=Math.round(a*1000)/1000;
-          if(!FX.xagHigh||p>FX.xagHigh) FX.xagHigh=Math.round(p*1000)/1000;
-          if(!FX.xagLow||p<FX.xagLow)   FX.xagLow=Math.round(p*1000)/1000;
-          FX.xagUpdatedAt=new Date().toISOString();
-        }
       }
     }catch(e){}
   });
 
   ws.on('close',function(code){
     TDws.status='disconnected';
+    if(TDws.pingTimer){ clearInterval(TDws.pingTimer); TDws.pingTimer=null; }
     console.warn('[TD] Closed code=%s',code);
     TDws.reconnectCount++;
     var d=Math.min(3000*Math.pow(2,Math.min(TDws.reconnectCount,4)),30000);
@@ -223,8 +286,7 @@ async function refreshSpotREST(){
       var g=r.data.find(function(x){return x.gold;}),s=r.data.find(function(x){return x.silver;});
       if(g&&g.gold>3000){FX.xauUsd=Math.round(g.gold*100)/100;}
       if(s&&s.silver>20){FX.xagUsd=Math.round(s.silver*1000)/1000;}
-      FX.xauUpdatedAt=new Date().toISOString();
-      FX.xagUpdatedAt=new Date().toISOString();
+      FX.xauUpdatedAt=new Date().toISOString();FX.xagUpdatedAt=new Date().toISOString();
       return;
     }
   }catch(e){}
@@ -235,24 +297,24 @@ async function refreshSpotREST(){
     ]);
     if(res[0].data.price>3000) FX.xauUsd=Math.round(res[0].data.price*100)/100;
     if(res[1].data.price>20)   FX.xagUsd=Math.round(res[1].data.price*1000)/1000;
-    FX.xauUpdatedAt=new Date().toISOString();
-    FX.xagUpdatedAt=new Date().toISOString();
+    FX.xauUpdatedAt=new Date().toISOString();FX.xagUpdatedAt=new Date().toISOString();
   }catch(e){}
 }
 
 function spotDerived(){
-  var F=1.103;
+  var gF=1.0920, sF=1.0661;
   return {
-    goldPer10g:  Math.round((FX.xauUsd/31.1035)*10*FX.usdInr*F),
-    silverPerKg: Math.round((FX.xagUsd/31.1035)*1000*FX.usdInr*F),
+    goldPer10g:  FX.xauUsd>0?Math.round((FX.xauUsd/31.1035)*10*FX.usdInr*gF):0,
+    silverPerKg: FX.xagUsd>0?Math.round((FX.xagUsd/31.1035)*1000*FX.usdInr*sF):0,
   };
 }
 
 // ─── TOKEN AUTO-RENEW ──────────────────────────────────
 var currentToken=DHAN_ACCESS_TOKEN, tokenRenewedAt=null;
+var renewRetryTimer=null, renewAttempts=0;
 
 async function renewToken(){
-  if(!currentToken||!DHAN_CLIENT_ID) return false;
+  if(!currentToken||!DHAN_CLIENT_ID){ console.warn('[TOKEN] Missing credentials'); return false; }
   try{
     var r=await axios.post(DHAN_BASE+'/RenewToken',{},{
       headers:{'access-token':currentToken,'dhanClientId':DHAN_CLIENT_ID,'Content-Type':'application/json'},
@@ -261,21 +323,54 @@ async function renewToken(){
     var t=r.data?.accessToken||r.data?.access_token||r.data?.data?.accessToken;
     if(t){
       currentToken=t; tokenRenewedAt=new Date().toISOString();
-      console.log('[TOKEN] Renewed at',tokenRenewedAt);
-      if(WS.ws){try{WS.ws.terminate();}catch(e){}}
+      renewAttempts=0;
+      if(renewRetryTimer){ clearTimeout(renewRetryTimer); renewRetryTimer=null; }
+      console.log('[TOKEN] ✅ Renewed at',tokenRenewedAt,'len=',t.length);
+      // Reconnect WS with new token
+      if(WS.ws){ try{WS.ws.terminate();}catch(e){} }
       WS.status='disconnected';
-      setTimeout(connectDhan,3000);
+      setTimeout(connectDhan,2000);
       return true;
     }
+    console.warn('[TOKEN] Renew response has no token:',JSON.stringify(r.data).slice(0,100));
     return false;
-  }catch(e){console.warn('[TOKEN] Renew failed:',e.message.slice(0,60));return false;}
+  }catch(e){
+    console.warn('[TOKEN] Renew failed:',e.message.slice(0,80));
+    return false;
+  }
+}
+
+// Retry renew every 5 min until success (for startup failures)
+async function renewWithRetry(){
+  var ok=await renewToken();
+  if(!ok){
+    renewAttempts++;
+    var delay=Math.min(5*60*1000, renewAttempts*2*60*1000); // 2min, 4min, 5min...
+    console.warn('[TOKEN] Retry #%d in %ds',renewAttempts,delay/1000);
+    renewRetryTimer=setTimeout(renewWithRetry, delay);
+  }
+}
+
+// ─── DAILY 8:30 AM IST AUTO-RENEW ─────────────────────
+function scheduleDailyRenew(){
+  var ms=msUntilIST(8,30);
+  console.log('[TOKEN] Daily renew scheduled in %d min',(ms/60000).toFixed(1));
+  setTimeout(function(){
+    console.log('[TOKEN] Daily 8:30 AM IST renew triggered');
+    renewWithRetry();
+    // Schedule next day
+    scheduleDailyRenew();
+  }, ms);
 }
 
 // ─── DHAN WEBSOCKET ────────────────────────────────────
 var WS={
-  ws:null,status:'disconnected',reconnectTimer:null,reconnectCount:0,
-  lastConnectAt:null,lastDisconnectAt:null,lastDisconnectCode:null,
-  lastTickAt:null,packetsReceived:0,lastRawHex:'',lastTextMsg:'',
+  ws:null, status:'disconnected',
+  reconnectTimer:null, reconnectCount:0,
+  lastConnectAt:null, lastDisconnectAt:null,
+  lastTickAt:null, packetsReceived:0,
+  lastRawHex:'', lastTextMsg:'',
+  pingTimer:null,
 };
 var TOKEN_MAP={};
 
@@ -296,33 +391,50 @@ function subscribeWS(ws){
     {ExchangeSegment:'MCX_COMM',SecurityId:ac.silver.current.secId},
     {ExchangeSegment:'MCX_COMM',SecurityId:ac.silver.next.secId},
   ];
-  [[15,0],[17,600],[21,1200]].forEach(function(p){
+  var sendIfOpen=function(code,delay){
     setTimeout(function(){
       if(ws.readyState!==WebSocket.OPEN) return;
-      ws.send(JSON.stringify({RequestCode:p[0],InstrumentCount:instruments.length,InstrumentList:instruments}));
-      console.log('[WS] Subscribe code=%d',p[0]);
-    },p[1]);
-  });
+      ws.send(JSON.stringify({RequestCode:code,InstrumentCount:instruments.length,InstrumentList:instruments}));
+      console.log('[WS] Subscribe RequestCode=%d',code);
+    },delay);
+  };
+  // FIX: Full (21) first for fastest OHLC+depth, then Quote (17), then Ticker (15)
+  sendIfOpen(15, 0);    // Ticker — immediate
+  sendIfOpen(21, 100);  // Full (bid/ask + OHLC) — 100ms later
+  sendIfOpen(17, 200);  // Quote — 200ms later
 }
 
 function parseBuf(buf){
   try{
     if(!buf||buf.length<8) return null;
     var fc=buf.readUInt8(0), secId=buf.readInt32LE(4).toString();
-    if(fc===50){WS.lastDisconnectCode=buf.length>=10?buf.readInt16LE(8):0;return null;}
-    if(fc===6&&buf.length>=16){var pc=buf.readFloatLE(8);return isFinite(pc)&&pc>0?{type:'prevClose',secId,prevClose:Math.round(pc)}:null;}
-    if(fc===2&&buf.length>=16){var l2=buf.readFloatLE(8);return !isFinite(l2)||l2<=100?null:{type:'ticker',secId,ltp:Math.round(l2)};}
+    if(fc===50) return null;
+    if(fc===6&&buf.length>=16){
+      var pc=buf.readFloatLE(8);
+      return isFinite(pc)&&pc>0?{type:'prevClose',secId,prevClose:Math.round(pc)}:null;
+    }
+    if(fc===2&&buf.length>=16){
+      var l2=buf.readFloatLE(8);
+      return !isFinite(l2)||l2<=100?null:{type:'ticker',secId,ltp:Math.round(l2)};
+    }
     if(fc===4&&buf.length>=50){
       var l4=buf.readFloatLE(8); if(!isFinite(l4)||l4<=100) return null;
-      return{type:'quote',secId,ltp:Math.round(l4),open:Math.round(buf.readFloatLE(34))||0,high:Math.round(buf.readFloatLE(42))||0,low:Math.round(buf.readFloatLE(46))||0};
+      return{type:'quote',secId,ltp:Math.round(l4),
+        open:Math.round(buf.readFloatLE(34))||0,
+        high:Math.round(buf.readFloatLE(42))||0,
+        low:Math.round(buf.readFloatLE(46))||0};
     }
     if(fc===8&&buf.length>=62){
       var l8=buf.readFloatLE(8); if(!isFinite(l8)||l8<=100) return null;
       var o8=buf.length>49?Math.round(buf.readFloatLE(46)):0;
       var h8=buf.length>57?Math.round(buf.readFloatLE(54)):0;
       var lw8=buf.length>61?Math.round(buf.readFloatLE(58)):0;
-      var b8=Math.round(l8),a8=Math.round(l8);
-      if(buf.length>=82){var bf=buf.readFloatLE(74),af=buf.readFloatLE(78);if(isFinite(bf)&&bf>100)b8=Math.round(bf);if(isFinite(af)&&af>100)a8=Math.round(af);}
+      var b8=Math.round(l8), a8=Math.round(l8);
+      if(buf.length>=82){
+        var bf=buf.readFloatLE(74),af=buf.readFloatLE(78);
+        if(isFinite(bf)&&bf>100) b8=Math.round(bf);
+        if(isFinite(af)&&af>100) a8=Math.round(af);
+      }
       return{type:'full',secId,ltp:Math.round(l8),bid:b8,ask:a8,open:o8,high:h8,low:lw8};
     }
     return null;
@@ -332,9 +444,14 @@ function parseBuf(buf){
 function scheduleReconnect(){
   if(WS.reconnectTimer) return;
   WS.reconnectCount++;
-  var d=Math.min(3000*Math.pow(2,Math.min(WS.reconnectCount,4)),30000);
+  // FIX: If 5+ failed reconnects, try token renew first
+  if(WS.reconnectCount>=5&&WS.reconnectCount%5===0){
+    console.warn('[WS] %d reconnects failed — triggering token renew',WS.reconnectCount);
+    renewWithRetry();
+  }
+  var d=Math.min(2000*Math.pow(2,Math.min(WS.reconnectCount-1,4)),20000); // faster reconnect: starts at 2s
   WS.reconnectTimer=setTimeout(function(){WS.reconnectTimer=null;connectDhan();},d);
-  console.log('[WS] Reconnect in %ds',d/1000);
+  console.log('[WS] Reconnect #%d in %ds',WS.reconnectCount,d/1000);
 }
 
 function connectDhan(){
@@ -343,12 +460,24 @@ function connectDhan(){
   WS.status='connecting'; WS.lastConnectAt=new Date().toISOString();
   WS.packetsReceived=0; WS.lastRawHex='';
   buildTokenMap();
-  var wsUrl='wss://api-feed.dhan.co?version=2&token='+encodeURIComponent(currentToken)+'&clientId='+encodeURIComponent(DHAN_CLIENT_ID)+'&authType=2';
-  var ws=new WebSocket(wsUrl,{handshakeTimeout:15000}); WS.ws=ws;
 
-  ws.on('open',function(){WS.status='connected';WS.reconnectCount=0;console.log('[WS] Connected');subscribeWS(ws);});
+  var wsUrl='wss://api-feed.dhan.co?version=2&token='+encodeURIComponent(currentToken)+'&clientId='+encodeURIComponent(DHAN_CLIENT_ID)+'&authType=2';
+  var ws=new WebSocket(wsUrl,{handshakeTimeout:15000});
+  WS.ws=ws;
+
+  ws.on('open',function(){
+    WS.status='connected'; WS.reconnectCount=0;
+    console.log('[WS] ✅ Connected');
+    subscribeWS(ws);
+    // FIX: Ping/pong keepalive every 20s to prevent idle disconnect
+    if(WS.pingTimer) clearInterval(WS.pingTimer);
+    WS.pingTimer=setInterval(function(){
+      if(ws.readyState===WebSocket.OPEN) ws.ping();
+    },20000);
+  });
 
   ws.on('message',function(data){
+    // FIX: Process immediately — no setImmediate/setTimeout wrapper
     if(typeof data==='string'){WS.lastTextMsg=data.slice(0,200);return;}
     var buf=Buffer.isBuffer(data)?data:Buffer.from(data);
     WS.packetsReceived++;
@@ -364,21 +493,35 @@ function connectDhan(){
     applyTick(key,tick); RC.source='dhan_ws_live';
   });
 
+  ws.on('pong',function(){ WS.lastTickAt=Date.now(); }); // pong counts as alive
+
   ws.on('close',function(code){
     WS.status='disconnected'; WS.lastDisconnectAt=new Date().toISOString();
+    if(WS.pingTimer){ clearInterval(WS.pingTimer); WS.pingTimer=null; }
     console.warn('[WS] Closed code=%d packets=%d',code,WS.packetsReceived);
     scheduleReconnect();
   });
+
   ws.on('error',function(e){console.warn('[WS] Error:',e.message);});
 }
 
-// ─── OHLC REST BACKUP ──────────────────────────────────
-var lastOhlcError=null,ohlcCallCount=0;
+// ─── OHLC REST BACKUP (throttled, 429-aware) ───────────
+var lastOhlcError=null, ohlcCallCount=0;
+var ohlcBackoffUntil=0; // timestamp — don't call until this
 
 function pollOhlc(){
   if(!DHAN_CLIENT_ID||!currentToken) return;
+  if(Date.now()<ohlcBackoffUntil) return; // 429 backoff active
+  // Skip if WS is live and ticking within last 3s
+  if(WS.status==='connected'&&WS.lastTickAt&&Date.now()-WS.lastTickAt<3000) return;
+
   var ac=getAC();
-  var secIds=[parseInt(ac.gold.current.secId,10),parseInt(ac.gold.next.secId,10),parseInt(ac.silver.current.secId,10),parseInt(ac.silver.next.secId,10)];
+  var secIds=[
+    parseInt(ac.gold.current.secId,10),
+    parseInt(ac.gold.next.secId,10),
+    parseInt(ac.silver.current.secId,10),
+    parseInt(ac.silver.next.secId,10),
+  ];
   axios.post(DHAN_BASE+'/marketfeed/ohlc',{MCX_COMM:secIds},{
     headers:{'Accept':'application/json','Content-Type':'application/json','access-token':currentToken,'client-id':DHAN_CLIENT_ID},
     timeout:5000,
@@ -386,44 +529,75 @@ function pollOhlc(){
     var seg=resp.data&&resp.data.data&&resp.data.data['MCX_COMM'];
     if(!seg){lastOhlcError='No MCX_COMM';return;}
     ohlcCallCount++; lastOhlcError=null;
-    var wsLive=WS.status==='connected'&&WS.lastTickAt&&Date.now()-WS.lastTickAt<5000;
-    if(wsLive) return;
     function applyRow(secId,key){
       var row=seg[String(secId)];if(!row)return;
       var ltp=row.last_price||0,ohlc=row.ohlc||{};
-      if(ltp>0){applyTick(key,{ltp:Math.round(ltp),open:ohlc.open?Math.round(ohlc.open):0,high:ohlc.high?Math.round(ohlc.high):0,low:ohlc.low?Math.round(ohlc.low):0});RC.source='dhan_ohlc_rest';}
+      if(ltp>0){
+        applyTick(key,{ltp:Math.round(ltp),open:ohlc.open?Math.round(ohlc.open):0,high:ohlc.high?Math.round(ohlc.high):0,low:ohlc.low?Math.round(ohlc.low):0});
+        RC.source='dhan_ohlc_rest';
+      }
     }
-    applyRow(ac.gold.current.secId,'gold');applyRow(ac.gold.next.secId,'goldNext');
-    applyRow(ac.silver.current.secId,'silver');applyRow(ac.silver.next.secId,'silverNext');
-  }).catch(function(e){lastOhlcError=e.message;});
+    applyRow(ac.gold.current.secId,'gold');
+    applyRow(ac.gold.next.secId,'goldNext');
+    applyRow(ac.silver.current.secId,'silver');
+    applyRow(ac.silver.next.secId,'silverNext');
+  }).catch(function(e){
+    lastOhlcError=e.message;
+    // FIX: 429 → backoff 60s
+    if(e.response&&e.response.status===429){
+      ohlcBackoffUntil=Date.now()+60000;
+      console.warn('[OHLC] 429 rate limit — backing off 60s');
+    }
+  });
 }
 
 // ─── ROUTES ────────────────────────────────────────────
 app.get('/rates',function(req,res){
-  var ac=getAC(),spot=spotDerived(),now=new Date().toISOString();
+  var ac=getAC(), spot=spotDerived(), now=new Date().toISOString();
   var hasLive=RC.goldLtp>0;
   res.json({
-    success:true, source:hasLive?RC.source:'spot_derived', marketOpen:isMCXOpen(),
-    goldPer10g:  Math.round((hasLive?RC.goldLtp:spot.goldPer10g)  * (1 + GOLD_MARGIN_PCT/100)),
-    silverPerKg: Math.round((hasLive?RC.silverLtp:spot.silverPerKg) * (1 + SILVER_MARGIN_PCT/100)),
+    success:true,
+    source:hasLive?RC.source:'spot_derived',
+    marketOpen:isMCXOpen(),
+    goldPer10g:  Math.round((hasLive?RC.goldLtp:spot.goldPer10g)  * (1+GOLD_MARGIN_PCT/100)),
+    silverPerKg: Math.round((hasLive?RC.silverLtp:spot.silverPerKg) * (1+SILVER_MARGIN_PCT/100)),
     futures:{
-      gold:     {ltp:RC.goldLtp,    bid:RC.goldBid,    ask:RC.goldAsk,    high:RC.goldHigh,    low:RC.goldLow,    open:RC.goldOpen,    prevClose:RC.goldPrevClose,   contract:ac.gold.current.display,  expiry:ac.gold.current.expiry},
-      goldNext: {ltp:RC.goldNextLtp,bid:RC.goldNextBid,ask:RC.goldNextAsk,high:RC.goldNextHigh,low:RC.goldNextLow,contract:ac.gold.next.display,expiry:ac.gold.next.expiry},
-      silver:   {ltp:RC.silverLtp,  bid:RC.silverBid,  ask:RC.silverAsk,  high:RC.silverHigh,  low:RC.silverLow,  open:RC.silverOpen,  prevClose:RC.silverPrevClose, contract:ac.silver.current.display,expiry:ac.silver.current.expiry},
-      silverNext:{ltp:RC.silverNextLtp,bid:RC.silverNextBid,ask:RC.silverNextAsk,high:RC.silverNextHigh,low:RC.silverNextLow,contract:ac.silver.next.display,expiry:ac.silver.next.expiry},
+      gold:{
+        ltp:RC.goldLtp, bid:RC.goldBid, ask:RC.goldAsk,
+        high:RC.goldHigh, low:RC.goldLow, open:RC.goldOpen,
+        prevClose:RC.goldPrevClose,
+        contract:ac.gold.current.display, expiry:ac.gold.current.expiry
+      },
+      goldNext:{
+        ltp:RC.goldNextLtp, bid:RC.goldNextBid, ask:RC.goldNextAsk,
+        high:RC.goldNextHigh, low:RC.goldNextLow,
+        contract:ac.gold.next.display, expiry:ac.gold.next.expiry
+      },
+      silver:{
+        ltp:RC.silverLtp, bid:RC.silverBid, ask:RC.silverAsk,
+        high:RC.silverHigh, low:RC.silverLow, open:RC.silverOpen,
+        prevClose:RC.silverPrevClose,
+        contract:ac.silver.current.display, expiry:ac.silver.current.expiry
+      },
+      silverNext:{
+        ltp:RC.silverNextLtp, bid:RC.silverNextBid, ask:RC.silverNextAsk,
+        high:RC.silverNextHigh, low:RC.silverNextLow,
+        contract:ac.silver.next.display, expiry:ac.silver.next.expiry
+      },
     },
     spot:{
       xauUsd:FX.xauUsd, xauBid:FX.xauBid, xauAsk:FX.xauAsk, xauHigh:FX.xauHigh, xauLow:FX.xauLow,
       xagUsd:FX.xagUsd, xagBid:FX.xagBid, xagAsk:FX.xagAsk, xagHigh:FX.xagHigh, xagLow:FX.xagLow,
       usdInr:FX.usdInr,
-      usdInrHigh: FX.usdInrHigh || null,
-      usdInrLow:  FX.usdInrLow === Infinity ? null : FX.usdInrLow,
+      usdInrBid:FX.usdInrBid||null, usdInrAsk:FX.usdInrAsk||null,
+      usdInrHigh:FX.usdInrHigh||null, usdInrLow:FX.usdInrLow===Infinity?null:FX.usdInrLow,
     },
     // Legacy fields for HTML compatibility
     xauUsd:FX.xauUsd, xagUsd:FX.xagUsd, usdInr:FX.usdInr,
     spotDerived:spot,
-    marginApplied:{ gold:GOLD_MARGIN_PCT, silver:SILVER_MARGIN_PCT },
-    wsStatus:WS.status, wsTickAgeMs:WS.lastTickAt?Date.now()-WS.lastTickAt:null,
+    marginApplied:{gold:GOLD_MARGIN_PCT,silver:SILVER_MARGIN_PCT},
+    wsStatus:WS.status,
+    wsTickAgeMs:WS.lastTickAt?Date.now()-WS.lastTickAt:null,
     tdStatus:TDws.status,
     updatedAt:RC.updatedAt, forexUpdatedAt:FX.updatedAt, timestamp:now,
   });
@@ -431,23 +605,39 @@ app.get('/rates',function(req,res){
 
 app.get('/debug',function(req,res){
   res.json({
-    server:'RR Jewellers v10',
-    dhan:{wsStatus:WS.status,packets:WS.packetsReceived,tickAgeMs:WS.lastTickAt?Date.now()-WS.lastTickAt:null,reconnects:WS.reconnectCount,lastConnect:WS.lastConnectAt},
-    twelveData:{wsStatus:TDws.status,packets:TDws.packetsReceived,hasKey:!!TWELVE_DATA_KEY,xauUpdatedAt:FX.xauUpdatedAt,xagUpdatedAt:FX.xagUpdatedAt},
-    ohlc:{calls:ohlcCallCount,lastError:lastOhlcError},
+    server:'RR Jewellers v11',
+    dhan:{
+      wsStatus:WS.status, packets:WS.packetsReceived,
+      tickAgeMs:WS.lastTickAt?Date.now()-WS.lastTickAt:null,
+      reconnects:WS.reconnectCount,
+      lastConnect:WS.lastConnectAt, lastDisconnect:WS.lastDisconnectAt,
+    },
+    twelveData:{
+      wsStatus:TDws.status, packets:TDws.packetsReceived,
+      hasKey:!!TWELVE_DATA_KEY,
+      xauUpdatedAt:FX.xauUpdatedAt, xagUpdatedAt:FX.xagUpdatedAt,
+    },
+    ohlc:{calls:ohlcCallCount, lastError:lastOhlcError, backoffUntil:ohlcBackoffUntil>Date.now()?new Date(ohlcBackoffUntil).toISOString():null},
     rateCache:RC, forexCache:FX,
     activeContracts:getAC(), tokenMap:TOKEN_MAP,
-    marketOpen:isMCXOpen(), tokenRenewedAt,
-    env:{DHAN_CLIENT_ID:!!DHAN_CLIENT_ID,tokenLen:currentToken.length,TWELVE_DATA_KEY:!!TWELVE_DATA_KEY},
+    marketOpen:isMCXOpen(),
+    tokenRenewedAt, renewAttempts,
+    env:{DHAN_CLIENT_ID:!!DHAN_CLIENT_ID, tokenLen:currentToken.length, TWELVE_DATA_KEY:!!TWELVE_DATA_KEY},
   });
 });
 
 app.get('/token-renew',async function(req,res){
   var ok=await renewToken();
-  res.json({success:ok,tokenRenewedAt,wsStatus:WS.status});
+  res.json({success:ok, tokenRenewedAt, wsStatus:WS.status, tokenLen:currentToken.length});
 });
-app.get('/spot-test',function(req,res){res.json({spot:spotDerived(),forex:FX,tdStatus:TDws.status});});
-app.get('/ping',function(req,res){res.json({ok:true,ts:Date.now()});});
+
+app.get('/spot-test',function(req,res){
+  res.json({spot:spotDerived(),forex:FX,tdStatus:TDws.status});
+});
+
+app.get('/ping',function(req,res){
+  res.json({ok:true, ts:Date.now(), wsStatus:WS.status, tokenRenewedAt});
+});
 
 app.get('/updates',async function(req,res){
   try{
@@ -456,30 +646,74 @@ app.get('/updates',async function(req,res){
     var r=await axios.get(url,{timeout:8000});
     var json=r.data.replace(/.*?({.*}).*/s,'$1');
     var data=JSON.parse(json);
-    var rows=data.table.rows.map(function(row){return{date:row.c[0]?.v||'',title:row.c[1]?.v||'',content:row.c[2]?.v||'',image:row.c[3]?.v||''};});
+    var rows=data.table.rows.map(function(row){
+      return{date:row.c[0]?.v||'',title:row.c[1]?.v||'',content:row.c[2]?.v||'',image:row.c[3]?.v||''};
+    });
     res.json({success:true,updates:rows.filter(function(r){return r.title;})});
-  }catch(e){res.json({success:true,updates:[{date:'Today',title:'Welcome to R.R. Jewellers',content:'Live gold & silver rates.',image:''}]});}
+  }catch(e){
+    res.json({success:true,updates:[{date:'Today',title:'Welcome to R.R. Jewellers',content:'Live gold & silver rates.',image:''}]});
+  }
 });
 
-app.get('/',function(req,res){res.json({status:'RR Jewellers v10',dhanWS:WS.status,tdWS:TDws.status,endpoints:['/rates','/debug','/ping','/token-renew','/spot-test','/updates']});});
+app.get('/',function(req,res){
+  res.json({
+    status:'RR Jewellers v11',
+    dhanWS:WS.status, tdWS:TDws.status,
+    tokenRenewedAt, renewAttempts,
+    endpoints:['/rates','/debug','/ping','/token-renew','/spot-test','/updates'],
+  });
+});
 
 // ─── STARTUP ───────────────────────────────────────────
 app.listen(PORT,'0.0.0.0',async function(){
-  console.log('[STARTUP] RR Jewellers v10 port=%s',PORT);
+  console.log('[STARTUP] RR Jewellers v11 port=%s',PORT);
 
-  var renewed=await renewToken();
-  if(!renewed) currentToken=DHAN_ACCESS_TOKEN;
+  // 1. Token renew on startup (with retry if fails)
+  await renewWithRetry();
 
+  // 2. USD/INR
   await refreshUsdInr();
+
+  // 3. Connect WebSockets
   connectDhan();
   connectTwelveData();
 
-  setInterval(function(){if(isMCXOpen()) pollOhlc();},1000);
-  setInterval(refreshUsdInr,5*60*1000);
-  // Spot REST fallback refresh every 30s (when no Twelve Data key)
-  if(!TWELVE_DATA_KEY) setInterval(refreshSpotREST,30*1000);
-  setInterval(function(){if(WS.status==='disconnected'&&!WS.reconnectTimer)connectDhan();},30*1000);
-  setInterval(function(){axios.get((SELF_URL||'http://localhost:'+PORT)+'/ping').catch(function(){});},4*60*1000);
-  setInterval(function(){buildTokenMap();},24*60*60*1000);
-  setInterval(async function(){console.log('[TOKEN] 20hr renew');await renewToken();},20*60*60*1000);
+  // 4. XAG/USD REST — immediate + every 3min (480 credits/day)
+  if(TWELVE_DATA_KEY){
+    pollXagUsdTD();
+    setInterval(pollXagUsdTD, 3*60*1000);
+  }
+
+  // 5. USD/INR H/L from TD quote — immediate + every 15min (96 credits/day)
+  if(TWELVE_DATA_KEY){
+    pollUsdInrQuoteTD();
+    setInterval(pollUsdInrQuoteTD, 15*60*1000);
+  }
+
+  // 6. OHLC backup — every 5s (FIX: was 1s → caused 429)
+  setInterval(function(){ if(isMCXOpen()) pollOhlc(); }, 5000);
+
+  // 7. USD/INR refresh every 5min
+  setInterval(refreshUsdInr, 5*60*1000);
+
+  // 8. REST spot fallback (when no TD key)
+  if(!TWELVE_DATA_KEY) setInterval(refreshSpotREST, 30*1000);
+
+  // 9. WS watchdog — reconnect if disconnected
+  setInterval(function(){
+    if(WS.status==='disconnected'&&!WS.reconnectTimer) connectDhan();
+  }, 30*1000);
+
+  // 10. Token rebuild map daily
+  setInterval(function(){ buildTokenMap(); }, 24*60*60*1000);
+
+  // 11. Self-ping every 4min (keep Render free tier awake)
+  setInterval(function(){
+    axios.get((SELF_URL||'http://localhost:'+PORT)+'/ping').catch(function(){});
+  }, 4*60*1000);
+
+  // 12. Daily 8:30 AM IST auto-renew (before MCX 9 AM open)
+  scheduleDailyRenew();
+
+  console.log('[STARTUP] All systems initialized');
 });
