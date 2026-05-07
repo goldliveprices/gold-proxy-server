@@ -441,63 +441,141 @@ function spotDerived(){
   };
 }
 
-// Token renew
+// ─── TOKEN SYSTEM ─────────────────────────────────────────────────────────────
+// HOW IT WORKS:
+//   Method 1 (PRIMARY): generateAccessToken via TOTP
+//     - Needs: DHAN_CLIENT_ID + DHAN_PIN + DHAN_TOTP_SECRET env vars
+//     - Generates fresh token every day at 8:30 AM IST automatically
+//     - DHAN_TOTP_SECRET = the base32 secret from Dhan's QR code (NOT the 6-digit code)
+//       Get it: web.dhan.co → Profile → DhanHQ APIs → Setup TOTP → copy the secret key
+//
+//   Method 2 (FALLBACK): RenewToken API (only works if current token is still valid)
+//
+//   Method 3 (MANUAL): Update DHAN_ACCESS_TOKEN env var on Render → server detects it
+//
+// SETUP (one time):
+//   Render Environment Variables:
+//     DHAN_CLIENT_ID     = your client ID (already set)
+//     DHAN_ACCESS_TOKEN  = current token (already set)
+//     DHAN_PIN           = your 6-digit Dhan login PIN  ← ADD THIS
+//     DHAN_TOTP_SECRET   = base32 secret from TOTP setup ← ADD THIS
+
+var speakeasy; // loaded lazily
+try{ speakeasy=require('speakeasy'); }catch(e){ speakeasy=null; }
+
 var currentToken=DHAN_ACCESS_TOKEN,tokenRenewedAt=null,renewRetryTimer=null,renewAttempts=0;
-async function renewToken(){
-  if(!DHAN_CLIENT_ID) return false;
-  // Always try fresh env var token first (operator may have updated it on Render)
-  var envToken=process.env.DHAN_ACCESS_TOKEN||'';
-  if(envToken&&envToken!==currentToken&&envToken.length>50){
-    console.log('[TOKEN] Env token updated, switching to new env token len=%d',envToken.length);
-    currentToken=envToken;
-    tokenRenewedAt=new Date().toISOString();
-    renewAttempts=0;
-    if(renewRetryTimer){clearTimeout(renewRetryTimer);renewRetryTimer=null;}
-    if(WS.ws){try{WS.ws.terminate();}catch(e){}}
-    WS.status='disconnected';
-    setTimeout(connectDhan,2000);
-    return true;
-  }
-  if(!currentToken) return false;
+
+// Generate 6-digit TOTP code from base32 secret
+function getTOTP(secret){
+  if(!speakeasy||!secret) return null;
   try{
-    var r=await axios.post(DHAN_BASE+'/RenewToken',{},{
-      headers:{'access-token':currentToken,'dhanClientId':DHAN_CLIENT_ID,'Content-Type':'application/json'},
-      timeout:12000,
-    });
-    var t=r.data?.accessToken||r.data?.access_token||r.data?.data?.accessToken;
-    if(t){
-      currentToken=t;tokenRenewedAt=new Date().toISOString();renewAttempts=0;
-      if(renewRetryTimer){clearTimeout(renewRetryTimer);renewRetryTimer=null;}
-      console.log('[TOKEN] Renewed via API len=%d',t.length);
-      if(WS.ws){try{WS.ws.terminate();}catch(e){}}
-      WS.status='disconnected';
-      setTimeout(connectDhan,2000);
-      return true;
-    }
-    console.warn('[TOKEN] API returned no token:',JSON.stringify(r.data).slice(0,80));
-    return false;
+    return speakeasy.totp({secret:secret,encoding:'base32'});
   }catch(e){
-    console.warn('[TOKEN] fail:',e.message.slice(0,80));
-    // On 400/401 — token is definitely expired, nothing we can do until env var is updated
-    if(e.response&&(e.response.status===400||e.response.status===401)){
-      console.warn('[TOKEN] 400/401 — token expired. Update DHAN_ACCESS_TOKEN env var on Render.');
-    }
-    return false;
+    console.warn('[TOKEN] TOTP gen fail:',e.message);
+    return null;
   }
 }
+
+// Apply a freshly obtained token
+function applyNewToken(t,src){
+  currentToken=t;
+  tokenRenewedAt=new Date().toISOString();
+  renewAttempts=0;
+  if(renewRetryTimer){clearTimeout(renewRetryTimer);renewRetryTimer=null;}
+  console.log('[TOKEN] ✅ New token via %s len=%d at %s',src,t.length,tokenRenewedAt);
+  if(WS.ws){try{WS.ws.terminate();}catch(e){}}
+  WS.status='disconnected';
+  setTimeout(connectDhan,2000);
+}
+
+async function renewToken(){
+  if(!DHAN_CLIENT_ID) return false;
+
+  // ── Method 0: Check if env var was updated manually on Render ──────────────
+  var envToken=process.env.DHAN_ACCESS_TOKEN||'';
+  if(envToken&&envToken!==currentToken&&envToken.length>100){
+    console.log('[TOKEN] Env var updated — using new token');
+    applyNewToken(envToken,'env-var');
+    return true;
+  }
+
+  // ── Method 1: generateAccessToken via TOTP (fully automatic) ──────────────
+  var DHAN_PIN    = process.env.DHAN_PIN||'';
+  var DHAN_TOTP_SECRET = process.env.DHAN_TOTP_SECRET||'';
+  if(DHAN_PIN&&DHAN_TOTP_SECRET){
+    var totp = getTOTP(DHAN_TOTP_SECRET);
+    if(totp){
+      try{
+        var r1=await axios.post(
+          'https://auth.dhan.co/app/generateAccessToken',
+          {},
+          {
+            params:{dhanClientId:DHAN_CLIENT_ID,pin:DHAN_PIN,totp:totp},
+            timeout:15000,
+          }
+        );
+        var t1=r1.data?.accessToken||r1.data?.access_token;
+        if(t1&&t1.length>100){
+          applyNewToken(t1,'TOTP-generateAccessToken');
+          return true;
+        }
+        console.warn('[TOKEN] TOTP method: no token in response:',JSON.stringify(r1.data).slice(0,120));
+      }catch(e){
+        console.warn('[TOKEN] TOTP generateAccessToken fail:',e.response?.status,e.message.slice(0,80));
+      }
+    } else {
+      console.warn('[TOKEN] speakeasy not installed — run: npm install speakeasy');
+    }
+  } else {
+    if(!DHAN_PIN)      console.warn('[TOKEN] DHAN_PIN not set — add to Render env vars');
+    if(!DHAN_TOTP_SECRET) console.warn('[TOKEN] DHAN_TOTP_SECRET not set — add to Render env vars');
+  }
+
+  // ── Method 2: RenewToken (only works if current token is still active) ─────
+  if(currentToken){
+    try{
+      var r2=await axios.post(DHAN_BASE+'/RenewToken',{},{
+        headers:{'access-token':currentToken,'dhanClientId':DHAN_CLIENT_ID,'Content-Type':'application/json'},
+        timeout:12000,
+      });
+      var t2=r2.data?.accessToken||r2.data?.access_token||r2.data?.data?.accessToken;
+      if(t2&&t2.length>100){
+        applyNewToken(t2,'RenewToken-API');
+        return true;
+      }
+      console.warn('[TOKEN] RenewToken: no token:',JSON.stringify(r2.data).slice(0,80));
+    }catch(e){
+      var s=e.response?.status;
+      if(s===400||s===401){
+        console.warn('[TOKEN] RenewToken 400/401 — token expired. Need DHAN_PIN+DHAN_TOTP_SECRET set on Render.');
+      } else {
+        console.warn('[TOKEN] RenewToken fail:',s,e.message.slice(0,60));
+      }
+    }
+  }
+
+  return false;
+}
+
 async function renewWithRetry(){
   var ok=await renewToken();
   if(!ok){
     renewAttempts++;
-    var d=Math.min(renewAttempts*2*60*1000,5*60*1000);
-    console.warn('[TOKEN] Retry #%d in %ds',renewAttempts,d/1000);
+    // Back off: 5min, 10min, 15min, max 30min
+    var d=Math.min(renewAttempts*5*60*1000,30*60*1000);
+    console.warn('[TOKEN] All methods failed. Retry #%d in %dm',renewAttempts,(d/60000).toFixed(0));
     renewRetryTimer=setTimeout(renewWithRetry,d);
   }
 }
+
 function scheduleDailyRenew(){
   var ms=msUntilIST(8,30);
-  console.log('[TOKEN] Daily renew in %dm',(ms/60000).toFixed(0));
-  setTimeout(function(){renewWithRetry();scheduleDailyRenew();},ms);
+  console.log('[TOKEN] Daily renew scheduled in %dm',(ms/60000).toFixed(0));
+  setTimeout(function(){
+    console.log('[TOKEN] 8:30 AM IST — generating fresh token');
+    renewWithRetry();
+    scheduleDailyRenew();
+  },ms);
 }
 function scheduleSpotHLReset(){
   var ms=msUntilIST(9,0);
