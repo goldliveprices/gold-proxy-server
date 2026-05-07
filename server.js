@@ -277,6 +277,30 @@ async function pollXagUsd(){
   console.warn('[XAG] All 5 sources failed — last known:',FX.xagUsd||'none');
 }
 
+// ── XAG daily H/L via TD /time_series (free tier works, 1 credit) ──
+// Called once on startup + every 15min
+// Uses 1day interval outputsize=1 which returns today's O/H/L/C
+async function pollXagHLTD(){
+  if(!TWELVE_DATA_KEY) return;
+  try{
+    var r=await axios.get('https://api.twelvedata.com/time_series',{
+      params:{symbol:'XAG/USD',interval:'1day',outputsize:1,apikey:TWELVE_DATA_KEY},
+      timeout:10000,
+    });
+    var vals=r.data&&r.data.values;
+    if(vals&&vals.length>0){
+      var today=vals[0];
+      var h=parseFloat(today.high),l=parseFloat(today.low);
+      if(h>20&&h<300&&h>l){
+        FX.xagHigh=Math.round(h*1000)/1000;
+        FX.xagLow=Math.round(l*1000)/1000;
+        console.log('[XAG-HL] time_series H=%s L=%s',FX.xagHigh,FX.xagLow);
+        broadcast();
+      }
+    }
+  }catch(e){console.warn('[XAG-HL] TD time_series fail:',e.message.slice(0,60));}
+}
+
 // ── TWELVE DATA /quote — daily H/L for XAU, XAG, USD/INR ──
 // One batch call = 3 credits. Runs every 10 min.
 // This is the ONLY source for accurate daily high/low — 
@@ -420,7 +444,21 @@ function spotDerived(){
 // Token renew
 var currentToken=DHAN_ACCESS_TOKEN,tokenRenewedAt=null,renewRetryTimer=null,renewAttempts=0;
 async function renewToken(){
-  if(!currentToken||!DHAN_CLIENT_ID) return false;
+  if(!DHAN_CLIENT_ID) return false;
+  // Always try fresh env var token first (operator may have updated it on Render)
+  var envToken=process.env.DHAN_ACCESS_TOKEN||'';
+  if(envToken&&envToken!==currentToken&&envToken.length>50){
+    console.log('[TOKEN] Env token updated, switching to new env token len=%d',envToken.length);
+    currentToken=envToken;
+    tokenRenewedAt=new Date().toISOString();
+    renewAttempts=0;
+    if(renewRetryTimer){clearTimeout(renewRetryTimer);renewRetryTimer=null;}
+    if(WS.ws){try{WS.ws.terminate();}catch(e){}}
+    WS.status='disconnected';
+    setTimeout(connectDhan,2000);
+    return true;
+  }
+  if(!currentToken) return false;
   try{
     var r=await axios.post(DHAN_BASE+'/RenewToken',{},{
       headers:{'access-token':currentToken,'dhanClientId':DHAN_CLIENT_ID,'Content-Type':'application/json'},
@@ -430,14 +468,22 @@ async function renewToken(){
     if(t){
       currentToken=t;tokenRenewedAt=new Date().toISOString();renewAttempts=0;
       if(renewRetryTimer){clearTimeout(renewRetryTimer);renewRetryTimer=null;}
-      console.log('[TOKEN] Renewed len=%d',t.length);
+      console.log('[TOKEN] Renewed via API len=%d',t.length);
       if(WS.ws){try{WS.ws.terminate();}catch(e){}}
       WS.status='disconnected';
       setTimeout(connectDhan,2000);
       return true;
     }
+    console.warn('[TOKEN] API returned no token:',JSON.stringify(r.data).slice(0,80));
     return false;
-  }catch(e){console.warn('[TOKEN] fail:',e.message.slice(0,80));return false;}
+  }catch(e){
+    console.warn('[TOKEN] fail:',e.message.slice(0,80));
+    // On 400/401 — token is definitely expired, nothing we can do until env var is updated
+    if(e.response&&(e.response.status===400||e.response.status===401)){
+      console.warn('[TOKEN] 400/401 — token expired. Update DHAN_ACCESS_TOKEN env var on Render.');
+    }
+    return false;
+  }
 }
 async function renewWithRetry(){
   var ok=await renewToken();
@@ -640,11 +686,17 @@ server.listen(PORT,'0.0.0.0',async function(){
   connectDhan();
   connectTwelveData();
 
-  // XAG/USD: gold-api.com primary, every 2min
+  // XAG/USD price — every 3min
   pollXagUsd();
   setInterval(pollXagUsd, 3*60*1000);
 
-  // USD/INR + XAU/XAG daily H/L from TD /quote — every 10min
+  // XAG daily H/L — TD time_series, every 15min (1 credit each)
+  if(TWELVE_DATA_KEY){
+    pollXagHLTD();
+    setInterval(pollXagHLTD, 15*60*1000);
+  }
+
+  // XAU/USDINR daily H/L from TD /quote — every 10min
   // This is what gives accurate daily High/Low for spot section
   if(TWELVE_DATA_KEY){
     pollSpotQuoteTD();
