@@ -22,10 +22,14 @@ const PORT              = process.env.PORT              || 3000;
 const SELF_URL          = process.env.SELF_URL          || '';
 const SHEET_ID          = process.env.SHEET_ID          || '';
 const DHAN_CLIENT_ID    = process.env.DHAN_CLIENT_ID    || '';
+// API key/secret for OAuth flow (alternative to TOTP, set on Render)
+const DHAN_API_KEY      = process.env.DHAN_API_KEY      || '';
+const DHAN_API_SECRET   = process.env.DHAN_API_SECRET   || '';
 const DHAN_ACCESS_TOKEN = process.env.DHAN_ACCESS_TOKEN || '';
 const TWELVE_DATA_KEY   = process.env.TWELVE_DATA_KEY   || '';
-const GOLD_MARGIN_PCT   = parseFloat(process.env.GOLD_MARGIN_PCT   || '0');
-const SILVER_MARGIN_PCT = parseFloat(process.env.SILVER_MARGIN_PCT || '0');
+// Margin read dynamically — so Render env var update takes effect immediately
+function GOLD_MARGIN_PCT(){ return parseFloat(process.env.GOLD_MARGIN_PCT||'0'); }
+function SILVER_MARGIN_PCT(){ return parseFloat(process.env.SILVER_MARGIN_PCT||'0'); }
 const DHAN_BASE         = 'https://api.dhan.co/v2';
 
 // MCX Contracts
@@ -157,8 +161,8 @@ function broadcast(){
 
 function buildPayload(){
   var ac=getAC();
-  var gSell=RC.goldLtp>0?Math.round(RC.goldLtp*(1+GOLD_MARGIN_PCT/100)):null;
-  var sSell=RC.silverLtp>0?Math.round(RC.silverLtp*(1+SILVER_MARGIN_PCT/100)):null;
+  var gSell=RC.goldLtp>0?Math.round(RC.goldLtp*(1+GOLD_MARGIN_PCT()/100)):null;
+  var sSell=RC.silverLtp>0?Math.round(RC.silverLtp*(1+SILVER_MARGIN_PCT()/100)):null;
   return {
     ts:Date.now(),src:RC.source,mktOpen:isMCXOpen(),
     goldSell:gSell,silverSell:sSell,
@@ -184,7 +188,7 @@ function buildPayload(){
       usdInr:FX.usdInr||null,usdInrBid:FX.usdInrBid||null,usdInrAsk:FX.usdInrAsk||null,
       usdInrHigh:FX.usdInrHigh||null,usdInrLow:FX.usdInrLow===Infinity?null:FX.usdInrLow,
     },
-    margin:{g:GOLD_MARGIN_PCT,s:SILVER_MARGIN_PCT},
+    margin:{g:GOLD_MARGIN_PCT(),s:SILVER_MARGIN_PCT()},
   };
 }
 
@@ -531,6 +535,11 @@ async function renewToken(){
     if(!DHAN_TOTP_SECRET) console.warn('[TOKEN] DHAN_TOTP_SECRET not set — add to Render env vars');
   }
 
+  // ── Method 1b: API key/secret OAuth flow (if DHAN_API_KEY is set) ──────────
+  // This is the 3-step OAuth: generate-consent → browser(skipped) → get-token
+  // NOTE: Step 2 requires browser — server cannot automate it. TOTP is better.
+  // We keep this here for reference but it won't work server-side without Step 2.
+
   // ── Method 2: RenewToken (only works if current token is still active) ─────
   if(currentToken){
     try{
@@ -729,7 +738,26 @@ function pollOhlc(){
 }
 
 // Routes
-app.get('/rates',function(req,res){res.json(buildPayload());});
+app.get('/rates',function(req,res){
+  var p=buildPayload();
+  // Add legacy fields so any HTML version works
+  p.success=true;
+  p.source=p.src;
+  p.wsTickAgeMs=WS.lastTickAt?Date.now()-WS.lastTickAt:null;
+  p.goldPer10g=p.goldSell||0;
+  p.silverPerKg=p.silverSell||0;
+  var sp=p.sp||{};
+  p.xauUsd=sp.xauUsd||0; p.xagUsd=sp.xagUsd||0; p.usdInr=sp.usdInr||0;
+  p.spot=sp;
+  p.futures={
+    gold:      p.f&&p.f.g  ?{ltp:p.f.g.ltp,  bid:p.f.g.bid,  ask:p.f.g.ask,  high:p.f.g.high,  low:p.f.g.low,  open:p.f.g.open}:{},
+    silver:    p.f&&p.f.s  ?{ltp:p.f.s.ltp,  bid:p.f.s.bid,  ask:p.f.s.ask,  high:p.f.s.high,  low:p.f.s.low,  open:p.f.s.open}:{},
+    goldNext:  p.f&&p.f.gN ?{ltp:p.f.gN.ltp, bid:p.f.gN.bid, ask:p.f.gN.ask, high:p.f.gN.high, low:p.f.gN.low}:{},
+    silverNext:p.f&&p.f.sN ?{ltp:p.f.sN.ltp, bid:p.f.sN.bid, ask:p.f.sN.ask, high:p.f.sN.high, low:p.f.sN.low}:{},
+  };
+  p.priceAsOf=p.ts?new Date(p.ts).toISOString():null;
+  res.json(p);
+});
 app.get('/debug',function(req,res){
   res.json({server:'RR Jewellers v12',htmlClients:feedClients.size,
     dhan:{wsStatus:WS.status,packets:WS.packetsReceived,tickAgeMs:WS.lastTickAt?Date.now()-WS.lastTickAt:null,reconnects:WS.reconnectCount,lastConnect:WS.lastConnectAt},
