@@ -151,11 +151,16 @@ setInterval(function(){
   });
 },25000);
 
+// ── Speed optimization: pre-stringify payload ────────────────
+// buildPayload() called once per tick, result cached as string
+var _cachedMsg='';
+
 function broadcast(){
   if(feedClients.size===0) return;
-  var msg=JSON.stringify(buildPayload());
+  _cachedMsg=JSON.stringify(buildPayload());
+  var buf=Buffer.from(_cachedMsg); // pre-allocate buffer once
   feedClients.forEach(function(ws){
-    if(ws.readyState===WebSocket.OPEN) ws.send(msg);
+    if(ws.readyState===1) ws.send(buf); // send same buffer to all clients
   });
 }
 
@@ -224,8 +229,8 @@ async function refreshUsdInr(){
 async function pollXagUsd(){
   function setXag(p,bid,ask,src){
     FX.xagUsd=Math.round(p*1000)/1000;
-    FX.xagBid=bid>0?Math.round(bid*1000)/1000:Math.round((p-0.02)*1000)/1000;
-    FX.xagAsk=ask>0?Math.round(ask*1000)/1000:Math.round((p+0.02)*1000)/1000;
+    FX.xagBid=bid>0?Math.round(bid*1000)/1000:0; // 0 = no mock
+    FX.xagAsk=ask>0?Math.round(ask*1000)/1000:0;
     FX.xagUpdatedAt=new Date().toISOString();
     console.log('[XAG]',src,'price=%s bid=%s ask=%s H=%s L=%s',FX.xagUsd,FX.xagBid,FX.xagAsk,FX.xagHigh||'--',FX.xagLow||'--');
     broadcast();
@@ -342,8 +347,8 @@ async function pollSpotQuoteTD(){
       if(al>20&&al<300) FX.xagLow=Math.round(al*1000)/1000;
       if(ap>20&&ap<300&&!FX.xagUsd){
         FX.xagUsd=Math.round(ap*1000)/1000;
-        FX.xagBid=Math.round((ap-0.02)*1000)/1000;
-        FX.xagAsk=Math.round((ap+0.02)*1000)/1000;
+        FX.xagBid=0; // no mock bid/ask
+        FX.xagAsk=0;
         FX.xagUpdatedAt=new Date().toISOString();
       }
       console.log('[TD-QUOTE] XAG=%s H=%s L=%s',FX.xagUsd,FX.xagHigh,FX.xagLow);
@@ -621,10 +626,11 @@ function subscribeWS(ws){
   var send=function(obj,delay){
     setTimeout(function(){if(ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify(obj));},delay);
   };
-  // RC15=Ticker (fastest LTP), RC17=Quote (OHLC+OHLC)
+  // RC15=Ticker ONLY — smallest packet (~16 bytes), absolute fastest
+  // OHLC comes from OHLC REST every 5s (already in server)
+  // Subscribing RC17 doubles message count for same instruments — skip it
   send({RequestCode:15,InstrumentCount:mcx.length,InstrumentList:mcx},0);
-  send({RequestCode:17,InstrumentCount:mcx.length,InstrumentList:mcx},200);
-  console.log('[WS] Subscribed %d MCX instruments',mcx.length);
+  console.log('[WS] Subscribed RC15-Ticker %d MCX instruments',mcx.length);
 }
 
 function parseBuf(buf){
@@ -693,9 +699,15 @@ function connectDhan(){
       if(key==='silver') RC.silverPrevClose=tick.prevClose;
       return;
     }
+    // Skip broadcast if LTP unchanged (same tick value, no visual change needed)
+    var prevLtp=0;
+    if(key==='gold') prevLtp=RC.goldLtp;
+    else if(key==='silver') prevLtp=RC.silverLtp;
+    else if(key==='goldNext') prevLtp=RC.goldNextLtp;
+    else if(key==='silverNext') prevLtp=RC.silverNextLtp;
     applyTick(key,tick);
     RC.source='dhan_ws_live';
-    broadcast(); // push immediately to all HTML clients
+    if(tick.ltp!==prevLtp) broadcast(); // only push if price actually changed
   });
 
   ws.on('pong',function(){WS.lastTickAt=Date.now();});
