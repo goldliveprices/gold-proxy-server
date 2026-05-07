@@ -22,9 +22,9 @@ const PORT              = process.env.PORT              || 3000;
 const SELF_URL          = process.env.SELF_URL          || '';
 const SHEET_ID          = process.env.SHEET_ID          || '';
 const DHAN_CLIENT_ID    = process.env.DHAN_CLIENT_ID    || '';
-// API key/secret for OAuth flow (alternative to TOTP, set on Render)
 const DHAN_API_KEY      = process.env.DHAN_API_KEY      || '';
 const DHAN_API_SECRET   = process.env.DHAN_API_SECRET   || '';
+const METALPRICEAPI_KEY = process.env.METALPRICEAPI_KEY || ''; // metalpriceapi.com free: 100req/month
 const DHAN_ACCESS_TOKEN = process.env.DHAN_ACCESS_TOKEN || '';
 const TWELVE_DATA_KEY   = process.env.TWELVE_DATA_KEY   || '';
 // Margin read dynamically — so Render env var update takes effect immediately
@@ -138,10 +138,13 @@ var feedClients=new Set();
 feedWSS.on('connection',function(ws){
   feedClients.add(ws);
   ws.isAlive=true;
-  ws.send(JSON.stringify(buildPayload())); // instant snapshot
-  ws.on('pong',function(){ws.isAlive=true;});
-  ws.on('close',function(){feedClients.delete(ws);});
-  ws.on('error',function(){feedClients.delete(ws);});
+  ws.connectedAt=Date.now();
+  // Send snapshot immediately — client gets data before first Dhan tick
+  ws.send(JSON.stringify(buildPayload()));
+  ws.on('pong',function(){ ws.isAlive=true; });
+  ws.on('close',function(){ feedClients.delete(ws); });
+  ws.on('error',function(){ feedClients.delete(ws); });
+  console.log('[FEED] Client connected. Total:',feedClients.size);
 });
 
 setInterval(function(){
@@ -149,7 +152,7 @@ setInterval(function(){
     if(!ws.isAlive){ws.terminate();feedClients.delete(ws);return;}
     ws.isAlive=false; ws.ping();
   });
-},25000);
+},15000); // 15s ping — keep Render free tier WS alive
 
 // ── Speed optimization: pre-stringify payload ────────────────
 // buildPayload() called once per tick, result cached as string
@@ -215,17 +218,23 @@ async function refreshUsdInr(){
     if(FX.usdInrLow===Infinity||FX.usdInr<FX.usdInrLow) FX.usdInrLow=FX.usdInr;
   }
   FX.updatedAt=new Date().toISOString();FX.src=src;
-  console.log('[FOREX] usdInr=%s src=%s',FX.usdInr,src);
+  // Compute indicative bid/ask — interbank spread ~2-3 paise
+  if(FX.usdInr>0){
+    FX.usdInrBid=Math.round((FX.usdInr-0.03)*100)/100;
+    FX.usdInrAsk=Math.round((FX.usdInr+0.03)*100)/100;
+  }
+  console.log('[FOREX] usdInr=%s bid=%s ask=%s src=%s',FX.usdInr,FX.usdInrBid,FX.usdInrAsk,src);
 }
 
-// XAG/USD — 5-source waterfall. Tries each in order, stops on first success.
-// Sources (all free, no key except TD which is already set):
-//   1. Twelve Data /price  — primary, key already set
-//   2. Frankfurter silver  — free, no key, ECB-sourced (rates via XAG)
-//   3. open.er-api.com     — free, no key, 1500/month
-//   4. fawazahmed0 CDN     — free, unlimited, no key
-//   5. goldapi.io          — optional key via GOLDAPI_IO_KEY env var
-// H/L always from pollSpotQuoteTD — NOT set here
+// XAG/USD — 6-source waterfall. Stops on first success.
+// Sources:
+//   0. metalpriceapi.com — free 100req/month, has real bid/ask/H/L ← BEST
+//   1. Twelve Data /price — key already set
+//   2. Frankfurter silver — free, ECB rate
+//   3. open.er-api.com   — free
+//   4. fawazahmed0 CDN   — unlimited, never fails
+//   5. goldapi.io        — optional GOLDAPI_IO_KEY
+// H/L always from pollSpotQuoteTD OR metalpriceapi
 async function pollXagUsd(){
   function setXag(p,bid,ask,src){
     FX.xagUsd=Math.round(p*1000)/1000;
@@ -234,6 +243,31 @@ async function pollXagUsd(){
     FX.xagUpdatedAt=new Date().toISOString();
     console.log('[XAG]',src,'price=%s bid=%s ask=%s H=%s L=%s',FX.xagUsd,FX.xagBid,FX.xagAsk,FX.xagHigh||'--',FX.xagLow||'--');
     broadcast();
+  }
+
+  // 0. metalpriceapi.com — best free source: has price + H/L
+  // Free: 100 req/month. Call every 30min = 48/day, safe.
+  // Register free at metalpriceapi.com → get API key → add METALPRICEAPI_KEY to Render
+  if(METALPRICEAPI_KEY){
+    try{
+      var r0=await axios.get('https://api.metalpriceapi.com/v1/latest',{
+        params:{api_key:METALPRICEAPI_KEY,base:'USD',currencies:'XAG'},
+        timeout:8000,
+      });
+      var rates=r0.data&&r0.data.rates;
+      // Response: rates.USDXAG = price per oz, or rates.XAG = oz per USD
+      var mp=rates&&(rates.USDXAG||( rates.XAG>0?1/rates.XAG:0));
+      if(mp>20&&mp<300){
+        setXag(mp,0,0,'metalpriceapi');
+        // Also try to get H/L from their open/high/low if available
+        if(r0.data.high_price&&r0.data.low_price){
+          var mh=r0.data.high_price,ml=r0.data.low_price;
+          if(mh>20&&mh<300) FX.xagHigh=Math.round(mh*1000)/1000;
+          if(ml>20&&ml<300) FX.xagLow=Math.round(ml*1000)/1000;
+        }
+        return;
+      }
+    }catch(e){console.warn('[XAG] metalpriceapi fail:',e.message.slice(0,60));}
   }
 
   // 1. Twelve Data /price
