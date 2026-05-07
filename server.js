@@ -1,10 +1,9 @@
 'use strict';
-// RR Jewellers v12.2 — Correct daily H/L for spot section
-// FIX: XAU/XAG/USDINR daily High/Low now from TD /quote batch (every 10min)
-//      WS tick accumulation gave wrong H/L (only since server start, not market open)
-// XAU/USD : Twelve Data WebSocket (live price) + /quote for daily H/L
-// XAG/USD : gold-api.com primary + TD /quote H/L + metals.live fallback
-// USD/INR : frankfurter REST every 5min + TD /quote for daily H/L
+// RR Jewellers v12.3
+// XAG/USD : goldapi.io (primary, free key needed) → TD price fallback
+//           H/L from TD /quote batch every 10min (accurate daily range)
+// XAU/USD : Twelve Data WebSocket live + TD /quote for daily H/L
+// USD/INR : frankfurter REST 5min + TD /quote for daily H/L
 // MCX     : Dhan WS RC15+RC17
 
 const express   = require('express');
@@ -210,61 +209,72 @@ async function refreshUsdInr(){
   console.log('[FOREX] usdInr=%s src=%s',FX.usdInr,src);
 }
 
-// XAG/USD — gold-api.com (primary, free, no key, has bid/ask/H/L)
-// Fallback 1: Twelve Data REST
-// Fallback 2: metals.live
+// XAG/USD — 5-source waterfall. Tries each in order, stops on first success.
+// Sources (all free, no key except TD which is already set):
+//   1. Twelve Data /price  — primary, key already set
+//   2. Frankfurter silver  — free, no key, ECB-sourced (rates via XAG)
+//   3. open.er-api.com     — free, no key, 1500/month
+//   4. fawazahmed0 CDN     — free, unlimited, no key
+//   5. goldapi.io          — optional key via GOLDAPI_IO_KEY env var
+// H/L always from pollSpotQuoteTD — NOT set here
 async function pollXagUsd(){
-  // Primary: gold-api.com — free, no key, gives bid/ask/open/high/low
-  try{
-    var r=await axios.get('https://www.gold-api.com/price/XAG',{timeout:6000});
-    var d=r.data;
-    if(d&&d.price>20&&d.price<300){
-      FX.xagUsd=Math.round(d.price*1000)/1000;
-      if(d.bid>0)  FX.xagBid=Math.round(d.bid*1000)/1000;
-      if(d.ask>0)  FX.xagAsk=Math.round(d.ask*1000)/1000;
-      if(d.high_price>0){if(!FX.xagHigh||d.high_price>FX.xagHigh) FX.xagHigh=Math.round(d.high_price*1000)/1000;}
-      if(d.low_price>0) {if(!FX.xagLow||d.low_price<FX.xagLow)   FX.xagLow=Math.round(d.low_price*1000)/1000;}
-      FX.xagUpdatedAt=new Date().toISOString();
-      console.log('[XAG] gold-api.com XAG=%s bid=%s ask=%s H=%s L=%s',FX.xagUsd,FX.xagBid,FX.xagAsk,FX.xagHigh,FX.xagLow);
-      broadcast();
-      return;
-    }
-  }catch(e){console.warn('[XAG] gold-api.com fail:',e.message.slice(0,50));}
+  function setXag(p,bid,ask,src){
+    FX.xagUsd=Math.round(p*1000)/1000;
+    FX.xagBid=bid>0?Math.round(bid*1000)/1000:Math.round((p-0.02)*1000)/1000;
+    FX.xagAsk=ask>0?Math.round(ask*1000)/1000:Math.round((p+0.02)*1000)/1000;
+    FX.xagUpdatedAt=new Date().toISOString();
+    console.log('[XAG]',src,'price=%s bid=%s ask=%s H=%s L=%s',FX.xagUsd,FX.xagBid,FX.xagAsk,FX.xagHigh||'--',FX.xagLow||'--');
+    broadcast();
+  }
 
-  // Fallback 1: Twelve Data REST
+  // 1. Twelve Data /price
   if(TWELVE_DATA_KEY){
     try{
-      var r2=await axios.get('https://api.twelvedata.com/price',{params:{symbol:'XAG/USD',apikey:TWELVE_DATA_KEY},timeout:8000});
-      var p=parseFloat(r2.data&&r2.data.price);
-      if(p>20&&p<300){
-        FX.xagUsd=Math.round(p*1000)/1000;
-        FX.xagBid=Math.round((p-0.02)*1000)/1000;
-        FX.xagAsk=Math.round((p+0.02)*1000)/1000;
-        if(!FX.xagHigh||p>FX.xagHigh) FX.xagHigh=Math.round(p*1000)/1000;
-        if(!FX.xagLow||p<FX.xagLow)   FX.xagLow=Math.round(p*1000)/1000;
-        FX.xagUpdatedAt=new Date().toISOString();
-        console.log('[XAG] TD fallback XAG=%s',FX.xagUsd);
-        broadcast();
-        return;
-      }
+      var r=await axios.get('https://api.twelvedata.com/price',{
+        params:{symbol:'XAG/USD',apikey:TWELVE_DATA_KEY},timeout:8000});
+      var p1=parseFloat(r.data&&r.data.price);
+      if(p1>20&&p1<300){setXag(p1,0,0,'TD');return;}
     }catch(e){console.warn('[XAG] TD fail:',e.message.slice(0,50));}
   }
 
-  // Fallback 2: metals.live
+  // 2. Frankfurter — returns XAG as currency rate (oz per USD, need reciprocal)
   try{
-    var r3=await axios.get('https://api.metals.live/v1/spot/silver',{timeout:6000});
-    if(Array.isArray(r3.data)){
-      var s=r3.data.find(function(x){return x.silver;});
-      if(s&&s.silver>20&&s.silver<300){
-        FX.xagUsd=Math.round(s.silver*1000)/1000;
-        FX.xagBid=Math.round((s.silver-0.02)*1000)/1000;
-        FX.xagAsk=Math.round((s.silver+0.02)*1000)/1000;
-        FX.xagUpdatedAt=new Date().toISOString();
-        console.log('[XAG] metals.live fallback XAG=%s',FX.xagUsd);
-        broadcast();
-      }
+    var r2=await axios.get('https://api.frankfurter.app/latest?from=USD&to=XAG',{timeout:6000});
+    var xagRate=r2.data&&r2.data.rates&&r2.data.rates.XAG;
+    // XAG rate = troy oz per USD, so price = 1/rate
+    if(xagRate>0){
+      var p2=Math.round((1/xagRate)*1000)/1000;
+      if(p2>20&&p2<300){setXag(p2,0,0,'Frankfurter');return;}
     }
-  }catch(e){console.warn('[XAG] metals.live fail:',e.message.slice(0,50));}
+  }catch(e){console.warn('[XAG] Frankfurter fail:',e.message.slice(0,50));}
+
+  // 3. open.er-api.com
+  try{
+    var r3=await axios.get('https://open.er-api.com/v6/latest/XAG',{timeout:6000});
+    var usdRate=r3.data&&r3.data.rates&&r3.data.rates.USD;
+    // rates[USD] = USD per oz, which IS the price
+    if(usdRate>20&&usdRate<300){setXag(usdRate,0,0,'open.er-api');return;}
+  }catch(e){console.warn('[XAG] open.er-api fail:',e.message.slice(0,50));}
+
+  // 4. fawazahmed0 CDN (unlimited, always available)
+  try{
+    var r4=await axios.get('https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/xag.json',{timeout:7000});
+    var usd4=r4.data&&r4.data.xag&&r4.data.xag.usd;
+    if(usd4>20&&usd4<300){setXag(usd4,0,0,'fawazahmed0');return;}
+  }catch(e){console.warn('[XAG] fawazahmed0 fail:',e.message.slice(0,50));}
+
+  // 5. goldapi.io (optional — set GOLDAPI_IO_KEY env var)
+  var GOLDAPI_IO_KEY=process.env.GOLDAPI_IO_KEY||'';
+  if(GOLDAPI_IO_KEY){
+    try{
+      var r5=await axios.get('https://www.goldapi.io/api/XAG/USD',{
+        headers:{'x-access-token':GOLDAPI_IO_KEY,'Content-Type':'application/json'},timeout:8000});
+      var d=r5.data;
+      if(d&&d.price>20&&d.price<300){setXag(d.price,d.bid||0,d.ask||0,'goldapi.io');return;}
+    }catch(e){console.warn('[XAG] goldapi.io fail:',e.message.slice(0,50));}
+  }
+
+  console.warn('[XAG] All 5 sources failed — last known:',FX.xagUsd||'none');
 }
 
 // ── TWELVE DATA /quote — daily H/L for XAU, XAG, USD/INR ──
@@ -632,7 +642,7 @@ server.listen(PORT,'0.0.0.0',async function(){
 
   // XAG/USD: gold-api.com primary, every 2min
   pollXagUsd();
-  setInterval(pollXagUsd, 2*60*1000);
+  setInterval(pollXagUsd, 3*60*1000);
 
   // USD/INR + XAU/XAG daily H/L from TD /quote — every 10min
   // This is what gives accurate daily High/Low for spot section
