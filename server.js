@@ -599,21 +599,42 @@ function connectFCS(){
 //     DHAN_PIN           = your 6-digit Dhan login PIN  ← ADD THIS
 //     DHAN_TOTP_SECRET   = base32 secret from TOTP setup ← ADD THIS
 
-var speakeasy; // loaded lazily
-try{ speakeasy=require('speakeasy'); }catch(e){ speakeasy=null; }
+// ── Pure Node.js TOTP (RFC 6238) — zero npm dependencies ──────────────────
+// Uses only built-in 'crypto' module. No speakeasy needed.
+var crypto=require('crypto');
 
-var currentToken=DHAN_ACCESS_TOKEN,tokenRenewedAt=null,renewRetryTimer=null,renewAttempts=0;
+function base32Decode(s){
+  var alpha='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  s=s.toUpperCase().replace(/=+$/,'');
+  var bits=0,val=0,out=[];
+  for(var i=0;i<s.length;i++){
+    var idx=alpha.indexOf(s[i]);
+    if(idx===-1) continue;
+    val=(val<<5)|idx; bits+=5;
+    if(bits>=8){bits-=8;out.push((val>>bits)&0xFF);}
+  }
+  return Buffer.from(out);
+}
 
-// Generate 6-digit TOTP code from base32 secret
 function getTOTP(secret){
-  if(!speakeasy||!secret) return null;
+  if(!secret) return null;
   try{
-    return speakeasy.totp({secret:secret,encoding:'base32'});
+    var key=base32Decode(secret.replace(/\s/g,''));
+    var t=Math.floor(Date.now()/1000/30);
+    var tb=Buffer.alloc(8);
+    tb.writeUInt32BE(Math.floor(t/0x100000000),0);
+    tb.writeUInt32BE(t>>>0,4);
+    var hmac=crypto.createHmac('sha1',key).update(tb).digest();
+    var offset=hmac[19]&0xF;
+    var code=((hmac[offset]&0x7F)<<24|(hmac[offset+1]&0xFF)<<16|(hmac[offset+2]&0xFF)<<8|(hmac[offset+3]&0xFF))%1000000;
+    return String(code).padStart(6,'0');
   }catch(e){
     console.warn('[TOKEN] TOTP gen fail:',e.message);
     return null;
   }
 }
+
+var currentToken=DHAN_ACCESS_TOKEN,tokenRenewedAt=null,renewRetryTimer=null,renewAttempts=0;
 
 // Apply a freshly obtained token
 function applyNewToken(t,src){
@@ -663,7 +684,7 @@ async function renewToken(){
         console.warn('[TOKEN] TOTP generateAccessToken fail:',e.response?.status,e.message.slice(0,80));
       }
     } else {
-      console.warn('[TOKEN] speakeasy not installed — run: npm install speakeasy');
+      console.warn('[TOKEN] TOTP code generation failed — check DHAN_TOTP_SECRET format (should be base32)');
     }
   } else {
     if(!DHAN_PIN)      console.warn('[TOKEN] DHAN_PIN not set — add to Render env vars');
