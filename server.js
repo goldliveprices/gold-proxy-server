@@ -1,5 +1,5 @@
 'use strict';
-// RR Jewellers v12.3
+// RR Jewellers v13 — FCS WS for XAU/XAG/USDINR, independent broadcast per source
 // XAG/USD : goldapi.io (primary, free key needed) → TD price fallback
 //           H/L from TD /quote batch every 10min (accurate daily range)
 // XAU/USD : Twelve Data WebSocket live + TD /quote for daily H/L
@@ -24,7 +24,8 @@ const SHEET_ID          = process.env.SHEET_ID          || '';
 const DHAN_CLIENT_ID    = process.env.DHAN_CLIENT_ID    || '';
 const DHAN_API_KEY      = process.env.DHAN_API_KEY      || '';
 const DHAN_API_SECRET   = process.env.DHAN_API_SECRET   || '';
-const METALPRICEAPI_KEY = process.env.METALPRICEAPI_KEY || ''; // metalpriceapi.com free: 100req/month
+const METALPRICEAPI_KEY = process.env.METALPRICEAPI_KEY || '';
+const FCS_API_KEY       = process.env.FCS_API_KEY       || ''; // fcsapi.com — XAU,XAG,USDINR WS
 const DHAN_ACCESS_TOKEN = process.env.DHAN_ACCESS_TOKEN || '';
 const TWELVE_DATA_KEY   = process.env.TWELVE_DATA_KEY   || '';
 // Margin read dynamically — so Render env var update takes effect immediately
@@ -484,6 +485,101 @@ function spotDerived(){
   };
 }
 
+
+// ══════════════════════════════════════════════════════════════════
+// FCS API WebSocket — XAU/USD, XAG/USD, USD/INR
+// Symbols: FX:XAUUSD, FX:XAGUSD, FX:USDINR
+// WS URL: wss://ws-v4.fcsapi.com/ws?access_key=YOUR_KEY
+// Speed: ~200ms per tick (forex market speed)
+// INDEPENDENT from Dhan — broadcasts immediately on own tick
+// ══════════════════════════════════════════════════════════════════
+var FCS={ws:null,status:'disconnected',reconnectTimer:null,reconnects:0,packets:0,pingTimer:null};
+
+function connectFCS(){
+  if(!FCS_API_KEY){ console.warn('[FCS] No FCS_API_KEY set'); return; }
+  if(FCS.status==='connecting'||FCS.status==='connected') return;
+  FCS.status='connecting';
+  console.log('[FCS] Connecting...');
+
+  var ws=new WebSocket('wss://ws-v4.fcsapi.com/ws?access_key='+FCS_API_KEY);
+  FCS.ws=ws;
+
+  ws.on('open',function(){
+    FCS.status='connected'; FCS.reconnects=0;
+    console.log('[FCS] Connected');
+    // Subscribe XAU/USD, XAG/USD, USD/INR — askbid mode for real bid/ask
+    var symbols=['FX:XAUUSD','FX:XAGUSD','FX:USDINR'];
+    symbols.forEach(function(sym){
+      ws.send(JSON.stringify({type:'join_symbol',symbol:sym,timeframe:'0'})); // 0=tick
+    });
+    // Keepalive ping every 25s
+    if(FCS.pingTimer) clearInterval(FCS.pingTimer);
+    FCS.pingTimer=setInterval(function(){
+      if(ws.readyState===WebSocket.OPEN) ws.ping();
+    },25000);
+  });
+
+  ws.on('message',function(raw){
+    var msg;
+    try{ msg=JSON.parse(raw); }catch(e){ return; }
+    if(!msg||msg.type!=='price') return;
+    var p=msg.prices;
+    if(!p) return;
+    FCS.packets++;
+
+    var sym=msg.symbol||'';
+    var price=p.c||p.close||0;
+    var bid=p.b||p.bid||0;
+    var ask=p.a||p.ask||0;
+    var now=new Date().toISOString();
+    var changed=false;
+
+    if(sym==='FX:XAUUSD'&&price>3000&&price<9000){
+      FX.xauUsd=Math.round(price*100)/100;
+      if(bid>3000) FX.xauBid=Math.round(bid*100)/100;
+      if(ask>3000) FX.xauAsk=Math.round(ask*100)/100;
+      if(!FX.xauHigh||price>FX.xauHigh) FX.xauHigh=Math.round(price*100)/100;
+      if(!FX.xauLow||price<FX.xauLow)   FX.xauLow=Math.round(price*100)/100;
+      FX.xauUpdatedAt=now; changed=true;
+      // console.log('[FCS] XAU=%s bid=%s ask=%s',FX.xauUsd,FX.xauBid,FX.xauAsk);
+    }
+    else if(sym==='FX:XAGUSD'&&price>20&&price<300){
+      FX.xagUsd=Math.round(price*1000)/1000;
+      if(bid>20) FX.xagBid=Math.round(bid*1000)/1000;
+      if(ask>20) FX.xagAsk=Math.round(ask*1000)/1000;
+      if(!FX.xagHigh||price>FX.xagHigh) FX.xagHigh=Math.round(price*1000)/1000;
+      if(!FX.xagLow||price<FX.xagLow)   FX.xagLow=Math.round(price*1000)/1000;
+      FX.xagUpdatedAt=now; changed=true;
+      // console.log('[FCS] XAG=%s bid=%s ask=%s',FX.xagUsd,FX.xagBid,FX.xagAsk);
+    }
+    else if(sym==='FX:USDINR'&&price>70&&price<115){
+      FX.usdInr=Math.round(price*100)/100;
+      if(bid>70) FX.usdInrBid=Math.round(bid*100)/100;
+      if(ask>70) FX.usdInrAsk=Math.round(ask*100)/100;
+      if(!FX.usdInrHigh||price>FX.usdInrHigh) FX.usdInrHigh=Math.round(price*100)/100;
+      if(FX.usdInrLow===Infinity||price<FX.usdInrLow) FX.usdInrLow=Math.round(price*100)/100;
+      FX.updatedAt=now; FX.src='fcs_ws'; changed=true;
+      // console.log('[FCS] USDINR=%s bid=%s ask=%s',FX.usdInr,FX.usdInrBid,FX.usdInrAsk);
+    }
+
+    // Broadcast IMMEDIATELY at FCS tick speed — independent of Dhan
+    if(changed) broadcast();
+  });
+
+  ws.on('pong',function(){ FCS.status='connected'; });
+
+  ws.on('close',function(code){
+    FCS.status='disconnected';
+    if(FCS.pingTimer){ clearInterval(FCS.pingTimer); FCS.pingTimer=null; }
+    FCS.reconnects++;
+    var d=Math.min(2000*Math.pow(2,Math.min(FCS.reconnects-1,4)),30000);
+    console.warn('[FCS] Closed code=%d reconnect #%d in %ds',code,FCS.reconnects,d/1000);
+    FCS.reconnectTimer=setTimeout(function(){ FCS.reconnectTimer=null; connectFCS(); },d);
+  });
+
+  ws.on('error',function(e){ console.warn('[FCS] err:',e.message); });
+}
+
 // ─── TOKEN SYSTEM ─────────────────────────────────────────────────────────────
 // HOW IT WORKS:
 //   Method 1 (PRIMARY): generateAccessToken via TOTP
@@ -808,6 +904,7 @@ app.get('/debug',function(req,res){
   res.json({server:'RR Jewellers v12',htmlClients:feedClients.size,
     dhan:{wsStatus:WS.status,packets:WS.packetsReceived,tickAgeMs:WS.lastTickAt?Date.now()-WS.lastTickAt:null,reconnects:WS.reconnectCount,lastConnect:WS.lastConnectAt},
     twelveData:{wsStatus:TDws.status,packets:TDws.packetsReceived,hasKey:!!TWELVE_DATA_KEY,xauUpdatedAt:FX.xauUpdatedAt,xagUpdatedAt:FX.xagUpdatedAt},
+    fcs:{wsStatus:FCS.status,packets:FCS.packets,hasKey:!!FCS_API_KEY,reconnects:FCS.reconnects},
     ohlc:{calls:ohlcCallCount,lastError:lastOhlcError,backoffUntil:ohlcBackoffUntil>Date.now()?new Date(ohlcBackoffUntil).toISOString():null},
     rateCache:RC,forexCache:FX,activeContracts:getAC(),tokenMap:TOKEN_MAP,
     marketOpen:isMCXOpen(),tokenRenewedAt,renewAttempts,
@@ -828,7 +925,7 @@ app.get('/updates',async function(req,res){
     res.json({success:true,updates:rows.filter(function(r){return r.title;})});
   }catch(e){res.json({success:true,updates:[{date:'Today',title:'Welcome to R.R. Jewellers',content:'Live gold & silver rates.',image:''}]});}
 });
-app.get('/',function(req,res){res.json({status:'RR Jewellers v12',dhanWS:WS.status,tdWS:TDws.status,htmlClients:feedClients.size,tokenRenewedAt,endpoints:['/rates','/debug','/ping','/token-renew','/spot-test','/updates','/feed (WS push)']});});
+app.get('/',function(req,res){res.json({status:'RR Jewellers v13',dhanWS:WS.status,tdWS:TDws.status,fcsWS:FCS.status,htmlClients:feedClients.size,tokenRenewedAt,endpoints:['/rates','/debug','/ping','/token-renew','/spot-test','/updates','/feed (WS push)']});});
 
 // Startup
 server.listen(PORT,'0.0.0.0',async function(){
@@ -837,6 +934,7 @@ server.listen(PORT,'0.0.0.0',async function(){
   await refreshUsdInr();
   connectDhan();
   connectTwelveData();
+  connectFCS(); // FCS WebSocket — XAU/XAG/USDINR live ticks
 
   // XAG/USD price — every 3min
   pollXagUsd();
@@ -860,6 +958,7 @@ server.listen(PORT,'0.0.0.0',async function(){
   setInterval(function(){if(isMCXOpen()) pollOhlc();},5000);
   setInterval(refreshUsdInr,5*60*1000);
   setInterval(function(){if(WS.status==='disconnected'&&!WS.reconnectTimer) connectDhan();},30*1000);
+  setInterval(function(){if(FCS_API_KEY&&FCS.status==='disconnected'&&!FCS.reconnectTimer) connectFCS();},30*1000);
   setInterval(function(){buildTokenMap();},24*60*60*1000);
   setInterval(function(){axios.get((SELF_URL||'http://localhost:'+PORT)+'/ping').catch(function(){});},4*60*1000);
   scheduleDailyRenew();
