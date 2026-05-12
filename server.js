@@ -303,36 +303,55 @@ function applyToken(t, src) {
 }
 
 async function renewToken() {
-  const cid = process.env.DHAN_CLIENT_ID||'';
-  if (!cid) return false;
-  // Check env var updated
-  const env = process.env.DHAN_ACCESS_TOKEN||'';
-  if (env && env !== currentToken && env.length > 100) {
+  const cid = process.env.DHAN_CLIENT_ID||'';  if (!cid) return false;
+
+  // Method 0: env var updated on Render dashboard
+  const env = process.env.DHAN_ACCESS_TOKEN||'';  if (env && env !== currentToken && env.length > 100) {
+    console.log('[TOKEN] New env var detected, applying');
     applyToken(env, 'env-update'); return true;
   }
-  // TOTP method
+
+  // Method 1: TOTP — try up to 3 times (TOTP changes every 30s, retry gets fresh code)
   const pin=process.env.DHAN_PIN||'', secret=process.env.DHAN_TOTP_SECRET||'';
   if (pin && secret) {
-    const totp = getTOTP(secret);
-    if (totp) {
-      const endpoints = [
-        {url:'https://auth.dhan.co/app/generateAccessToken',params:{dhanClientId:cid,pin,totp},data:{}},
-        {url:'https://api.dhan.co/v2/token/generate',params:{},data:{dhanClientId:cid,pin,totp}},
-      ];
-      for (const ep of endpoints) {
-        try {
-          const r = await axios.post(ep.url, ep.data, {params:ep.params, headers:{'Content-Type':'application/json'}, timeout:15000});
-          const t = r.data?.accessToken||r.data?.access_token||r.data?.data?.accessToken;
-          if (t && t.length>100) { applyToken(t,'TOTP'); return true; }
-        } catch(e) {
-          console.warn('[TOKEN] TOTP fail',ep.url,e.response?.status,e.message.slice(0,60));
-          if (e.response?.status===429) break;
+    for (let attempt=0; attempt<3; attempt++) {
+      // Generate fresh TOTP on each attempt (window may have shifted)
+      const totp = getTOTP(secret);
+      if (!totp) { console.warn('[TOKEN] TOTP generation failed'); break; }
+      console.log('[TOKEN] TOTP attempt %d code=%s', attempt+1, totp);
+      try {
+        const r = await axios.post(
+          'https://auth.dhan.co/app/generateAccessToken',
+          {},
+          {
+            params: { dhanClientId:cid, pin, totp },
+            headers: { 'Content-Type':'application/json' },
+            timeout: 20000, // 20s — Dhan endpoint can be slow
+          }
+        );
+        const t = r.data?.accessToken||r.data?.access_token||r.data?.data?.accessToken;
+        if (t && t.length > 100) {
+          console.log('[TOKEN] TOTP success attempt=%d', attempt+1);
+          applyToken(t, 'TOTP'); return true;
         }
+        console.warn('[TOKEN] TOTP attempt %d no token:', attempt+1, JSON.stringify(r.data).slice(0,100));
+      } catch(e) {
+        const s = e.response?.status;
+        console.warn('[TOKEN] TOTP attempt %d fail: status=%s msg=%s', attempt+1, s, e.message.slice(0,60));
+        if (s === 429) { console.warn('[TOKEN] Rate limited — stop retrying'); break; }
+        if (s === 400 || s === 401) { console.warn('[TOKEN] Bad credentials — check DHAN_PIN and DHAN_TOTP_SECRET'); break; }
+        // Timeout or 5xx — wait 2s and retry with fresh TOTP
+        if (attempt < 2) await new Promise(r=>setTimeout(r, 2000));
       }
     }
+  } else {
+    if (!pin)    console.warn('[TOKEN] DHAN_PIN not set');
+    if (!secret) console.warn('[TOKEN] DHAN_TOTP_SECRET not set');
   }
-  // RenewToken fallback
+
+  // Method 2: RenewToken (works only if current token still active)
   if (currentToken) {
+    console.log('[TOKEN] Trying RenewToken fallback');
     try {
       const r = await axios.post(DHAN_BASE+'/RenewToken',{},{
         headers:{'access-token':currentToken,'dhanClientId':cid,'Content-Type':'application/json'},
@@ -340,8 +359,14 @@ async function renewToken() {
       });
       const t=r.data?.accessToken||r.data?.access_token||r.data?.data?.accessToken;
       if (t&&t.length>100) { applyToken(t,'RenewToken'); return true; }
-    } catch(e) { console.warn('[TOKEN] RenewToken fail:',e.response?.status,e.message.slice(0,60)); }
+    } catch(e) {
+      const s=e.response?.status;
+      if (s===400||s===401) console.warn('[TOKEN] Token expired — TOTP must work for auto-renew');
+      else console.warn('[TOKEN] RenewToken fail:',s,e.message.slice(0,60));
+    }
   }
+
+  console.warn('[TOKEN] All methods failed. Manual token update needed on Render.');
   return false;
 }
 
@@ -349,7 +374,8 @@ async function renewWithRetry() {
   const ok = await renewToken();
   if (!ok) {
     renewAttempts++;
-    const d = Math.min(renewAttempts*3*60*1000, 15*60*1000);
+    // Retry: 2min → 5min → 10min → 15min max
+    const d = Math.min(renewAttempts * 2 * 60 * 1000, 15 * 60 * 1000);
     console.warn('[TOKEN] Retry #%d in %dm', renewAttempts, (d/60000).toFixed(0));
     renewTimer = setTimeout(renewWithRetry, d);
   }
